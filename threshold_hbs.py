@@ -632,6 +632,216 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             "sign_time": round(statistics.mean(sign_times), 8),
             "verify_time": round(statistics.mean(verify_times), 8),
         }
+    
+# Extension 2: distributed decision
+# helper-string assisted threshold signing       
+class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
+    def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
+        self.helper_strings = {}
+        super().__init__(parties, threshold_k, tree_height, approval_policies)
+
+    def dealer_setup(self):
+        for i in range(self.num_leaves):
+            sk, pk = self.generate_lamport_keypair()
+            self.leaf_secret_keys.append(sk)
+            self.leaf_public_keys.append(pk)
+
+        leaf_hashes = []
+        for pk in self.leaf_public_keys:
+            leaf_hashes.append(pk.leaf_hash(self))
+
+        self.merkle_levels = self.build_merkle_tree(leaf_hashes)
+        self.build_threshold_shares()
+        self.build_helper_strings()
+
+        self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
+
+    def build_helper_strings(self):
+        self.helper_strings = {}
+
+        for pid in range(self.parties):
+            self.helper_strings[pid] = {}
+            for leaf_index in range(self.num_leaves):
+                self.helper_strings[pid][leaf_index] = self.randbytes(16)
+
+    def lookup_helper_strings(self, leaf_index, signer_ids):
+        if leaf_index < 0 or leaf_index >= self.num_leaves:
+            raise IndexError("leaf index out of range")
+        
+        lookup = {}
+        for pid in signer_ids:
+            if pid < 0 or pid >= self.parties:
+                raise ValueError("invalid party id")
+            lookup[pid] = self.helper_strings[pid][leaf_index]
+
+        return lookup
+    
+    def build_session_id(self, message, leaf_index, signer_ids, helper_lookup):
+        parts = [b"distributed-session"]
+        parts.append(message)
+        parts.append(str(leaf_index).encode())
+
+        signer_ids_sorted = sorted(signer_ids)
+        for pid in signer_ids_sorted:
+            parts.append(str(pid).encode())
+            parts.append(helper_lookup[pid])
+
+        return self.h_tag(b"session-id", *parts)
+    
+    def party_agree_session(self, party_id, message, leaf_index, signer_ids, helper_lookup):
+        if party_id not in signer_ids:
+            raise PermissionError("party not selected for this signing session")
+        
+        if not self.approve(party_id, message):
+            raise PermissionError("party " + str(party_id) + " refused to sign")
+        
+        return self.build_session_id(message, leaf_index, signer_ids, helper_lookup)
+    
+    def create_signing_session(self, message, signer_ids, leaf_index=None):
+        if leaf_index is None:
+            leaf_index = self.next_unused_leaf()
+
+        if leaf_index is None:
+            raise RuntimeError("all Lamport leaves are exhausted")
+        
+        if leaf_index in self.used_leaves:
+            raise RuntimeError("leaf already used; one-time key reuse is forbidden")
+        
+        if signer_ids is None:
+            raise ValueError("signer_ids must be provided for distributed signing")
+        
+        unique_signer_ids = []
+        for pid in signer_ids:
+            if pid < 0 or pid >= self.parties:
+                raise ValueError("invalid party id in signer_ids")
+            if pid not in unique_signer_ids:
+                unique_signer_ids.append(pid)
+
+        if len(unique_signer_ids) < self.threshold_k:
+            raise ValueError("fewer than k signer ids were provided")
+        
+        helper_lookup = self.lookup_helper_strings(leaf_index, unique_signer_ids)
+
+        session_ids = []
+        approved_signers = []
+
+        for pid in unique_signer_ids:
+            try:
+                sid = self.party_agree_session(pid, message, leaf_index, unique_signer_ids, helper_lookup)
+                session_ids.append(sid)
+                approved_signers.append(pid)
+            except PermissionError:
+                pass
+
+        if len(approved_signers) < self.threshold_k:
+            raise PermissionError("fewer than k parties approved the distributed signing session")
+        
+        first_sid = session_ids[0]
+        for sid in session_ids:
+            if sid != first_sid:
+                raise RuntimeError("parties did not agree on the same session id")
+            
+        session = {
+            "message": message,
+            "leaf_index": leaf_index,
+            "signer_ids": approved_signers,
+            "helper_lookup": helper_lookup,
+            "session_id": first_sid,
+        }
+
+        return session
+    
+    def sign_with_session(self, session):
+        message = session["message"]
+        leaf_index = session["leaf_index"]
+        signer_ids = session["signer_ids"]
+        helper_lookup = session["helper_lookup"]
+        session_id = session["session_id"]
+
+        if leaf_index in self.used_leaves:
+            raise RuntimeError("leaf already used; one-time key reuse is forbidden")
+        
+        share_responses = []
+        
+        for pid in signer_ids:
+            recomputed_sid = self.party_agree_session(pid, message, leaf_index, signer_ids, helper_lookup)
+            if recomputed_sid != session_id:
+                raise RuntimeError("session id mismatch during signing")
+            
+            resp = self.party_produce_share(pid, leaf_index, message)
+            share_responses.append(resp)
+
+        if len(share_responses) < self.threshold_k:
+            raise PermissionError("fewer than k valid shares collected")
+        
+        bit_count = len(share_responses[0].selected_shares)
+        
+        for resp in share_responses:
+            if resp.leaf_index != leaf_index:
+                raise ValueError("inconsistent leaf index in responses")
+            if len(resp.selected_shares) != bit_count:
+                raise ValueError("inconsistent share count in responses")
+            
+        reconstructed_revealed = []
+
+        for bit_index in range(bit_count):
+            share_points = []
+
+            for resp in share_responses:
+                x_coordinate = resp.party_id + 1
+                share_vector = resp.selected_shares[bit_index]
+                share_points.append((x_coordinate, share_vector))
+
+            reconstructed_revealed.append(self.shamir_recombine(share_points))
+
+        self.used_leaves.add(leaf_index)
+
+        return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=reconstructed_revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+    
+    def sign(self, message, leaf_index=None, signer_ids=None):
+        session = self.create_signing_session(message=message, signer_ids=signer_ids, leaf_index=leaf_index,)
+
+        return self.sign_with_session(session)
+    
+    def benchmark(self, rounds):
+        setup_times = []
+        sign_times = []
+        verify_times = []
+
+        for i in range(rounds):
+            message = ("benchmark-message-" + str(i)).encode()
+
+            t0 = time.perf_counter()
+            scheme = DistributedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height,)
+            t1 = time.perf_counter()
+
+            signer_ids = []
+            for pid in range(self.threshold_k):
+                signer_ids.append(pid)
+
+            sig = scheme.sign(message, signer_ids=signer_ids)
+            t2 = time.perf_counter()
+
+            ok = scheme.verify(sig)
+            t3 = time.perf_counter()
+
+            if not ok:
+                raise RuntimeError("benchmark produced invalid signature")
+            
+            setup_times.append(t1 - t0)
+            sign_times.append(t2 - t1)
+            verify_times.append(t3 - t2)
+
+        return {
+            "parties":self.parties, 
+            "threshold_k": self.threshold_k, 
+            "tree_height": self.tree_height, 
+            "rounds":rounds, 
+            "setup_time": round(statistics.mean(setup_times), 8),
+            "sign_time": round(statistics.mean(sign_times), 8),
+            "verify_time": round(statistics.mean(verify_times), 8),
+        }
+
 
 
 
