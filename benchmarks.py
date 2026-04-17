@@ -1,6 +1,7 @@
 from threshold_hbs import ThresholdHBSScheme, KOfNThresholdHBSScheme, DistributedThresholdHBSScheme, BatchedThresholdHBSScheme, HierarchicalBatchedThresholdHBSScheme, WinternitzThresholdHBSScheme
 
 def main():
+    # Basic scheme (minimal)
     print("-- Benchmark: Minimal Threshold HBS --")
 
     mini_settings = [(2, 2), (2, 3), (3, 2), (3, 3), (4, 3),]
@@ -11,6 +12,7 @@ def main():
         print(result.to_dict())
 
     print()
+    # Extension 1: (k-of-n Threshold)
     print("-- Benchmark: Extension 1 k-of-n Threshold HBS --")
 
     ext_settings1 = [(4, 3, 3), (5, 3, 3), (5, 4, 2), (6, 3, 3), (6, 4, 3),]
@@ -21,6 +23,7 @@ def main():
         print(result)
 
     print()
+    # Extension 2: (Distributed Signing)
     print("-- Benchmark: Extension 2 Distributed Threshold HBS --")
 
     ext_settings2 = [(4, 3, 3), (5, 3, 3), (5, 4, 2), (6, 3, 3), (6, 4, 3),]
@@ -31,6 +34,7 @@ def main():
         print(result)
 
     print()
+    # Extension 3: (Batched Signing)
     print("-- Benchmark: Extension 3 Batched Threshold HBS --")
 
     ext_settings3 = [(4, 3, 4, 2), (4, 3, 4, 3), (5, 3, 4, 3), (5, 4, 4, 4), (6, 4, 4, 5),]
@@ -41,6 +45,7 @@ def main():
         print(result)
 
     print()
+    # Extension 4: (Hierarchical Batching)
     print("-- Benchmark: Extension 4 Hierarchical Batched Threshold HBS --")
 
     ext_settings4 = [(4, 3, 4, 2, 2), (4, 3, 4, 2, 3), (5, 3, 4, 2, 3), (5, 4, 4, 2, 4), (6, 4, 4, 3, 5),]
@@ -51,6 +56,7 @@ def main():
         print(result)
 
     print()
+    # Extension 5: (Winternitz Optimisation)
     print("-- Benchmark: Extension 5 Winternitz Threshold HBS --")
 
     ext_settings5 = [(4, 3, 3, 4), (4, 3, 3, 8), (4, 3, 3, 16), (5, 3, 3, 16), (5, 4, 3, 32),]

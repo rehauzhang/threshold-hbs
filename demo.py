@@ -1,6 +1,7 @@
 from threshold_hbs import ThresholdHBSScheme, KOfNThresholdHBSScheme, DistributedThresholdHBSScheme, BatchedThresholdHBSScheme, HierarchicalBatchedThresholdHBSScheme, WinternitzThresholdHBSScheme
 
 def main():
+    # Basic scheme (minimal)
     mini_scheme = ThresholdHBSScheme(parties=4, tree_height=3)
     mini_message = b"threshold hash-based signatures demo"
     mini_signature = mini_scheme.sign(mini_message)
@@ -14,6 +15,7 @@ def main():
     print("Verification result:", mini_scheme.verify(mini_signature))
     print()
 
+    # Extension 1: (k-of-n Threshold)
     ext_scheme1 = KOfNThresholdHBSScheme(parties=4, threshold_k=3, tree_height=3)
     ext_message1 = b"extension 1 k-of-n threshold demo"
     ext_signature1 = ext_scheme1.sign(ext_message1, active_party_ids=[0, 2, 3])
@@ -28,6 +30,7 @@ def main():
     print("Verification result:", ext_scheme1.verify(ext_signature1))
     print()
 
+    # Extension 2: (Distributed Signing)
     ext_scheme2 = DistributedThresholdHBSScheme(parties=4, threshold_k=3, tree_height=3)
     ext_message2 = b"extension 2 distributed threshold demo"
     ext_signature2 = ext_scheme2.sign(ext_message2, signer_ids=[0, 2, 3])
@@ -42,6 +45,7 @@ def main():
     print("Verification result:", ext_scheme2.verify(ext_signature2))
     print()
 
+    # Extension 3: (Batched Signing)
     ext_scheme3 = BatchedThresholdHBSScheme(parties=4, threshold_k=3, tree_height=4)
     batch_messages = [b"batch message 1", b"batch message 2", b"batch message 3",]
     ext_signature3 = ext_scheme3.sign_batch(batch_messages, active_party_ids=[0, 1, 2])
@@ -55,6 +59,7 @@ def main():
     print("Verification results:", ext_scheme3.verify_batch(ext_signature3))
     print()
 
+    # Extension 4: (Hierarchical Batching)
     ext_scheme4 = HierarchicalBatchedThresholdHBSScheme(parties=4, threshold_k=3, tree_height=4, subtree_height=2,)
     subtree_messages = [b"subtree message 1", b"subtree message 2", b"subtree message 3",]
     ext_batch_result = ext_scheme4.sign_batch_in_subtree(messages=subtree_messages, active_party_ids=[0, 1, 2],)
@@ -71,6 +76,7 @@ def main():
     print("Verification results:", ext_scheme4.verify_subtree_batch(ext_batch_result))
     print()
 
+    # Extension 5: (Winternitz Optimisation)
     ext_scheme5 = WinternitzThresholdHBSScheme(parties=4, threshold_k=3, tree_height=3, w=16,)
     ext_message5 = b"extension 5 winternitz threshold demo"
     ext_signature5 = ext_scheme5.sign(ext_message5, active_party_ids=[0, 1, 2])

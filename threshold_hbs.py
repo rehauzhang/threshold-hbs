@@ -59,6 +59,7 @@ class BenchmarkResult:
             "verify_time": round(self.verify_avg, 8),
         }
     
+# Basic scheme (minimal): Lamport + Merkle + secret Sharing
 class ThresholdHBSScheme:
     def __init__(self, parties, tree_height, approval_policies=None):
         if parties < 2:
@@ -633,8 +634,9 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             "verify_time": round(statistics.mean(verify_times), 8),
         }
     
-# Extension 2: distributed decision
-# helper-string assisted threshold signing       
+# Extension 2: distributed threshold signing
+# simulates local agreement between parties
+# uses helper strings and session IDs     
 class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
         self.helper_strings = {}
@@ -842,8 +844,9 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             "verify_time": round(statistics.mean(verify_times), 8),
         }
 
-# Extension 3: batch signing
-# buffered signing
+# Extension 3: batched signing
+# supports signing multiple messages in one call
+# improves throughput
 class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
         super().__init__(parties, threshold_k, tree_height, approval_policies)
@@ -928,6 +931,8 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
         }
     
 # Extension 4: hierarchical subtree-based batch signing
+# organises leaves into subtrees
+# performs batch signing within a subtree
 class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, subtree_height=2, approval_policies=None):
         if subtree_height < 1:
@@ -1074,6 +1079,8 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
         }
     
 # Extension 5: Winternitz-based threshold hash signatures
+# replaces Lamport OTS with Winternitz OTS
+# reduces signature size
 class WinternitzPublicKey:
     def __init__(self, pub):
         self.pub = pub
@@ -1371,7 +1378,5 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             "sign_time": round(statistics.mean(sign_times), 8),
             "verify_time": round(statistics.mean(verify_times), 8),
         }
-
-
 
 
