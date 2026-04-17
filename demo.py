@@ -1,4 +1,4 @@
-from threshold_hbs import ThresholdHBSScheme, KOfNThresholdHBSScheme, DistributedThresholdHBSScheme, BatchedThresholdHBSScheme
+from threshold_hbs import ThresholdHBSScheme, KOfNThresholdHBSScheme, DistributedThresholdHBSScheme, BatchedThresholdHBSScheme, HierarchicalBatchedThresholdHBSScheme
 
 def main():
     mini_scheme = ThresholdHBSScheme(parties=4, tree_height=3)
@@ -53,6 +53,22 @@ def main():
     print("Max signatures:", ext_scheme3.public_bundle.max_signatures)
     print("Batch size:", len(ext_signature3))
     print("Verification results:", ext_scheme3.verify_batch(ext_signature3))
+    print()
+
+    ext_scheme4 = HierarchicalBatchedThresholdHBSScheme(parties=4, threshold_k=3, tree_height=4, subtree_height=2,)
+    subtree_messages = [b"subtree message 1", b"subtree message 2", b"subtree message 3",]
+    ext_batch_result = ext_scheme4.sign_batch_in_subtree(messages=subtree_messages, active_party_ids=[0, 1, 2],)
+
+    print("-- Demo: Extension 4 (Hierarchical Batched Threshold HBS) --")
+    print("Parties:", ext_scheme4.parties)
+    print("Threshold k:", ext_scheme4.threshold_k)
+    print("Tree height:", ext_scheme4.tree_height)
+    print("Subtree height:", ext_scheme4.subtree_height)
+    print("Merkle root:", ext_scheme4.public_bundle.merkle_root.hex())
+    print("Max signatures:", ext_scheme4.public_bundle.max_signatures)
+    print("Subtree index:", ext_batch_result["subtree_index"])
+    print("Used leaf indices:", ext_batch_result["used_leaf_indices"])
+    print("Verification results:", ext_scheme4.verify_subtree_batch(ext_batch_result))
 
 if __name__ == "__main__":
     main()

@@ -926,6 +926,153 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
             "verify_time": round(statistics.mean(verify_times), 8),
             "avg_sign_time_per_message": round(statistics.mean(batch_sign_times) / batch_size, 8),
         }
+    
+# Extension 4: hierarchical subtree-based batch signing
+class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
+    def __init__(self, parties, threshold_k, tree_height, subtree_height=2, approval_policies=None):
+        if subtree_height < 1:
+            raise ValueError("subtree_height must be at least 1")
+        if subtree_height > tree_height:
+            raise ValueError("subtree_height cannot be larger than tree_height")
+        
+        self.subtree_height = subtree_height
+        self.subtree_size = 2 ** subtree_height
+        self.num_subtrees = self.num_subtrees_placeholder(tree_height, subtree_height)
+
+        super().__init__(parties, threshold_k, tree_height, approval_policies)
+
+    def num_subtrees_placeholder(self, tree_height, subtree_height):
+        total_leaves = 2 ** tree_height
+        subtree_size = 2 ** subtree_height
+        return total_leaves // subtree_size
+    
+    def get_subtree_index(self, leaf_index):
+        if leaf_index < 0 or leaf_index >= self.num_leaves:
+            raise IndexError("leaf index out of range")
+        return leaf_index // self.subtree_size
+    
+    def get_subtree_leaf_range(self, subtree_index):
+        if subtree_index < 0 or subtree_index >= self.num_subtrees:
+            raise IndexError("subtree index out of range")
+        
+        start_leaf = subtree_index * self.subtree_size
+        end_leaf = start_leaf + self.subtree_size - 1
+        return start_leaf, end_leaf
+    
+    def next_unused_leaf_in_subtree(self, subtree_index):
+        start_leaf, end_leaf = self.get_subtree_leaf_range(subtree_index)
+
+        for leaf_index in range(start_leaf, end_leaf + 1):
+            if leaf_index not in self.used_leaves:
+                return leaf_index
+            
+        return None
+    
+    def next_available_subtree(self):
+        for subtree_index in range(self.num_subtrees):
+            candidate = self.next_unused_leaf_in_subtree(subtree_index)
+            if candidate is not None:
+                return subtree_index
+        return None
+    
+    def sign_batch_in_subtree(self, messages, active_party_ids=None, subtree_index=None):
+        if messages is None or len(messages) == 0:
+            raise ValueError("messages must be a non-empty list")
+        
+        if subtree_index is None:
+            subtree_index = self.next_available_subtree()
+
+        if subtree_index is None:
+            raise RuntimeError("no subtree with available leaves")
+        
+        signatures = []
+        used_leaf_indices = []
+
+        current_leaf = self.next_unused_leaf_in_subtree(subtree_index)
+
+        if current_leaf is None:
+            raise RuntimeError("selected subtree has no available leaves")
+        
+        start_leaf, end_leaf = self.get_subtree_leaf_range(subtree_index)
+
+        for message in messages:
+            if current_leaf is None or current_leaf > end_leaf:
+                raise RuntimeError("not enough remaining leaves inside selected subtree")
+            
+            sig = self.sign(message=message, leaf_index=current_leaf, active_party_ids=active_party_ids,)
+
+            signatures.append(sig)
+            used_leaf_indices.append(current_leaf)
+
+            next_leaf = None
+            for candidate in range(current_leaf + 1, end_leaf + 1):
+                if candidate not in self.used_leaves:
+                    next_leaf = candidate
+                    break
+
+            current_leaf = next_leaf
+
+        return {
+            "subtree_index": subtree_index,
+            "subtree_leaf_range": (start_leaf, end_leaf),
+            "used_leaf_indices": used_leaf_indices,
+            "signatures": signatures,
+        }
+    
+    def verify_subtree_batch(self, batch_result):
+        signatures = batch_result["signatures"]
+        results = []
+
+        for sig in signatures:
+            results.append(self.verify(sig))
+
+        return results
+    
+    def benchmark_hierarchical_batch(self, rounds, batch_size):
+        setup_times = []
+        batch_sign_times = []
+        verify_times = []
+
+        for i in range(rounds):
+            messages = []
+            for j in range(batch_size):
+                messages.append(("hierarchical-batch-message-" + str(i) + "-" + str(j)).encode())
+
+            t0 = time.perf_counter()
+            scheme = HierarchicalBatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height, self.subtree_height,)
+            t1 = time.perf_counter()
+
+            batch_result = scheme.sign_batch_in_subtree(messages=messages, active_party_ids=list(range(self.threshold_k)))
+            t2 = time.perf_counter()
+
+            verify_ok = True
+            verify_results = scheme.verify_subtree_batch(batch_result)
+            for item in verify_results:
+                if not item:
+                    verify_ok = False
+                    break
+            t3 = time.perf_counter()
+
+            if not verify_ok:
+                raise RuntimeError("hierarchical batch benchmark produced invalid signature")
+            
+            setup_times.append(t1 - t0)
+            batch_sign_times.append(t2 - t1)
+            verify_times.append(t3 - t2)
+
+        return {
+            "parties":self.parties, 
+            "threshold_k": self.threshold_k, 
+            "tree_height": self.tree_height, 
+            "subtree_height": self.subtree_height,
+            "rounds":rounds, 
+            "batch_size": batch_size,
+            "setup_time": round(statistics.mean(setup_times), 8),
+            "hierarchical_batch_sign_time": round(statistics.mean(batch_sign_times), 8),
+            "verify_time": round(statistics.mean(verify_times), 8),
+            "avg_sign_time_per_message": round(statistics.mean(batch_sign_times) / batch_size, 8),
+        }
+
 
 
 
