@@ -17,16 +17,15 @@ def main():
 
     # Extension 1: (k-of-n Threshold)
     ext_scheme1 = KOfNThresholdHBSScheme(parties=4, threshold_k=3, tree_height=3)
-    ext_message1 = b"extension 1 k-of-n threshold demo"
+    ext_message1 = b"extension 1 k-of-k subtree demo"
     ext_signature1 = ext_scheme1.sign(ext_message1, active_party_ids=[0, 2, 3])
 
-    print("-- Demo: Extension 1 (k-of-n Threshold HBS) --")
+    print("-- Demo: Extension 1 (k-of-k subtrees for k-of-n) --")
     print("Parties:", ext_scheme1.parties)
     print("Threshold k:", ext_scheme1.threshold_k)
-    print("Merkle root:", ext_scheme1.public_bundle.merkle_root.hex())
-    print("Max signatures:", ext_scheme1.public_bundle.max_signatures)
+    print("Number of k-subtrees:", len(ext_scheme1.subset_parties))
     print("Leaf index used:", ext_signature1.leaf_index)
-    print("Revealed elements:", len(ext_signature1.revealed))
+    print("Assigned subset:", ext_scheme1.leaf_to_subset[ext_signature1.leaf_index])
     print("Verification result:", ext_scheme1.verify(ext_signature1))
     print()
 
@@ -35,13 +34,11 @@ def main():
     ext_message2 = b"extension 2 distributed threshold demo"
     ext_signature2 = ext_scheme2.sign(ext_message2, signer_ids=[0, 2, 3])
 
-    print("-- Demo: Extension 2 (Distributed Threshold HBS) --")
+    print("-- Demo: Extension 2 (helper strings + peer decision) --")
     print("Parties:", ext_scheme2.parties)
     print("Threshold k:", ext_scheme2.threshold_k)
-    print("Merkle root:", ext_scheme2.public_bundle.merkle_root.hex())
-    print("Max signatures:", ext_scheme2.public_bundle.max_signatures)
     print("Leaf index used:", ext_signature2.leaf_index)
-    print("Revealed elements:", len(ext_signature2.revealed))
+    print("Assigned subset:", ext_scheme2.leaf_to_subset[ext_signature2.leaf_index])
     print("Verification result:", ext_scheme2.verify(ext_signature2))
     print()
 
@@ -50,12 +47,11 @@ def main():
     batch_messages = [b"batch message 1", b"batch message 2", b"batch message 3",]
     ext_signature3 = ext_scheme3.sign_batch(batch_messages, active_party_ids=[0, 1, 2])
 
-    print("-- Demo: Extension 3 (Batched Threshold HBS) --")
+    print("-- Demo: Extension 3 (Merkle-buffered batched signing) --")
     print("Parties:", ext_scheme3.parties)
     print("Threshold k:", ext_scheme3.threshold_k)
-    print("Merkle root:", ext_scheme3.public_bundle.merkle_root.hex())
-    print("Max signatures:", ext_scheme3.public_bundle.max_signatures)
-    print("Batch size:", len(ext_signature3))
+    print("Batch size:", len(ext_signature3.messages))
+    print("Underlying leaf index:", ext_signature3.batch_root_signature.leaf_index)
     print("Verification results:", ext_scheme3.verify_batch(ext_signature3))
     print()
 
@@ -64,13 +60,11 @@ def main():
     subtree_messages = [b"subtree message 1", b"subtree message 2", b"subtree message 3",]
     ext_batch_result = ext_scheme4.sign_batch_in_subtree(messages=subtree_messages, active_party_ids=[0, 1, 2],)
 
-    print("-- Demo: Extension 4 (Hierarchical Batched Threshold HBS) --")
+    print("-- Demo: Extension 4 (Hierarchical higher layer Merkle trees) --")
     print("Parties:", ext_scheme4.parties)
     print("Threshold k:", ext_scheme4.threshold_k)
     print("Tree height:", ext_scheme4.tree_height)
     print("Subtree height:", ext_scheme4.subtree_height)
-    print("Merkle root:", ext_scheme4.public_bundle.merkle_root.hex())
-    print("Max signatures:", ext_scheme4.public_bundle.max_signatures)
     print("Subtree index:", ext_batch_result["subtree_index"])
     print("Used leaf indices:", ext_batch_result["used_leaf_indices"])
     print("Verification results:", ext_scheme4.verify_subtree_batch(ext_batch_result))
@@ -86,10 +80,7 @@ def main():
     print("Threshold k:", ext_scheme5.threshold_k)
     print("Winternitz w:", ext_scheme5.w)
     print("Number of chains:", ext_scheme5.num_chains)
-    print("Merkle root:", ext_scheme5.public_bundle.merkle_root.hex())
-    print("Max signatures:", ext_scheme5.public_bundle.max_signatures)
     print("Leaf index used:", ext_signature5.leaf_index)
-    print("Revealed elements:", len(ext_signature5.revealed))
     print("Verification result:", ext_scheme5.verify(ext_signature5))
 
 if __name__ == "__main__":

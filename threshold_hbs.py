@@ -2,6 +2,7 @@ import hashlib
 import secrets
 import statistics
 import time
+from itertools import combinations
 
 class LamportPublicKey:
     def __init__(self, pub):
@@ -18,6 +19,12 @@ class MerklePath:
     def __init__(self, siblings, directions):
         self.siblings = siblings
         self.directions = directions
+
+class HierarchicalMerklePath:
+    def __init__(self, local_path, upper_path, subtree_index):
+        self.local_path = local_path
+        self.upper_path = upper_path
+        self.subtree_index = subtree_index
 
 class ThresholdSignature:
     def __init__(self, leaf_index, message, revealed, lamport_public_key, auth_path):
@@ -59,6 +66,13 @@ class BenchmarkResult:
             "verify_time": round(self.verify_avg, 8),
         }
     
+class BatchThresholdSignature:
+    def __init__(self, batch_root_signature, messages, batch_paths, batch_root):
+        self.batch_root_signature = batch_root_signature
+        self.messages = messages
+        self.batch_paths = batch_paths
+        self.batch_root = batch_root
+    
 # Basic scheme (minimal): Lamport + Merkle + secret Sharing
 class ThresholdHBSScheme:
     def __init__(self, parties, tree_height, approval_policies=None):
@@ -76,9 +90,7 @@ class ThresholdHBSScheme:
         self.num_leaves = 2 ** tree_height
 
         if approval_policies is None:
-            approval_policies = []
-            for i in range(parties):
-                approval_policies.append(lambda message: True)
+            approval_policies = [lambda message: True for _ in range(parties)]
 
         if len(approval_policies) != parties:
             raise ValueError("approval_policies must have one entry for each party")
@@ -112,7 +124,7 @@ class ThresholdHBSScheme:
         return secrets.token_bytes(n)
     
     def xor_bytes(self, parts):
-        if len(parts) == 0:
+        if not parts:
             raise ValueError("xor_bytes needs at least one input")
         
         out = bytearray(parts[0])
@@ -133,7 +145,10 @@ class ThresholdHBSScheme:
         return bits
     
     def dealer_setup(self):
-        for i in range(self.num_leaves):
+        self.leaf_secret_keys = []
+        self.leaf_public_keys = []
+        self.party_shares = {pid: {} for pid in range(self.parties)}
+        for _ in range(self.num_leaves):
             sk, pk = self.generate_lamport_keypair()
             self.leaf_secret_keys.append(sk)
             self.leaf_public_keys.append(pk)
@@ -155,7 +170,7 @@ class ThresholdHBSScheme:
         pub_2d = [[], []]
 
         for branch in (0, 1):
-            for i in range(self.lamport_bits):
+            for _ in range(self.lamport_bits):
                 x = self.randbytes(self.digest_size)
                 secrets_2d[branch].append(x)
                 pub_2d[branch].append(self.H(x))
@@ -164,13 +179,7 @@ class ThresholdHBSScheme:
     
     def lamport_select_secret_elements(self, lamport_sk, message):
         digest_bits = self.bytes_to_bits(self.H(message))
-        revealed = []
-
-        for i in range(len(digest_bits)):
-            bit = digest_bits[i]
-            revealed.append(lamport_sk[bit][i])
-
-        return revealed
+        return [lamport_sk[bit][i] for i, bit in enumerate(digest_bits)]
     
     def verify_lamport_signature(self, message, revealed, pk):
         digest_bits = self.bytes_to_bits(self.H(message))
@@ -178,8 +187,7 @@ class ThresholdHBSScheme:
         if len(revealed) != self.lamport_bits:
             return False
         
-        for i in range(len(digest_bits)):
-            bit = digest_bits[i]
+        for i, bit in enumerate(digest_bits):
             if self.H(revealed[i]) != pk.pub[bit][i]:
                 return False
             
@@ -190,7 +198,7 @@ class ThresholdHBSScheme:
             raise ValueError("n must be at least 2")
         
         shares = []
-        for i in range(n - 1):
+        for _ in range(n - 1):
             shares.append(self.randbytes(len(secret)))
 
         final_share = self.xor_bytes([secret] + shares)
@@ -227,8 +235,8 @@ class ThresholdHBSScheme:
         if len(leaves) & (len(leaves) - 1):
             raise ValueError("number of leaves must be a power of two")
         
-        levels = [leaves]
-        current = leaves
+        levels = [list(leaves)]
+        current = list(leaves)
 
         while len(current) > 1:
             nxt = []
@@ -266,10 +274,7 @@ class ThresholdHBSScheme:
         
         cur = leaf_hash
 
-        for i in range(len(path.siblings)):
-            sibling = path.siblings[i]
-            direction = path.directions[i]
-
+        for sibling, direction in zip(path.siblings, path.directions):
             if direction == 0:
                 cur = self.merkle_parent(cur, sibling)
             elif direction == 1:
@@ -340,20 +345,16 @@ class ThresholdHBSScheme:
 
         return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=reconstructed_revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index))
     
-    def verify(self, signature):
-        lamport_ok = self.verify_lamport_signature(signature.message, signature.revealed, signature.lamport_public_key,)
+    def verify(self, signature, message=None, public_bundle=None):
+        message = signature.message if message is None else message
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+        lamport_ok = self.verify_lamport_signature(message, signature.revealed, signature.lamport_public_key,)
 
         if not lamport_ok:
             return False
         
-        return self.verify_merkle_path(signature.lamport_public_key.leaf_hash(self), signature.auth_path, self.public_bundle.merkle_root,)
-    
-    def dealer_direct_sign_for_testing(self, message, leaf_index):
-        if leaf_index < 0 or leaf_index >= self.num_leaves:
-            raise IndexError("leaf index out of range")
-        
-        return self.lamport_select_secret_elements(self.leaf_secret_keys[leaf_index], message)
-    
+        return self.verify_merkle_path(signature.lamport_public_key.leaf_hash(self), signature.auth_path, public_bundle.merkle_root,)
+       
     def benchmark(self, rounds):
         setup_times = []
         sign_times = []
@@ -381,8 +382,7 @@ class ThresholdHBSScheme:
 
         return BenchmarkResult(parties=self.parties, tree_height=self.tree_height, rounds=rounds, setup_avg=statistics.mean(setup_times), sign_avg=statistics.mean(sign_times), verify_avg=statistics.mean(verify_times),)
 
-# Extension 1: k-of-n threshold signing 
-# Shamir sharing helpers over GF(257)       
+# Extension 1: use k-of-k subtree to realise a k-of-n signing       
 class KOfNThresholdHBSScheme(ThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
         if threshold_k < 2:
@@ -391,12 +391,23 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             raise ValueError("threshold_k cannot be larger than parties")
         
         self.threshold_k = threshold_k
-        self.field_prime = 257
+        self.subset_parties = [tuple(s) for s in combinations(range(parties), threshold_k)]
+        self.subset_leaf_ranges = {}
+        self.leaf_to_subset = {}
 
         super().__init__(parties, tree_height, approval_policies)
 
     def dealer_setup(self):
-        for i in range(self.num_leaves):
+        subset_count = len(self.subset_parties)
+        if self.num_leaves < subset_count:
+            raise ValueError("tree_height is too small for all k-of-k subtrees")
+        
+        self.leaf_secret_keys = []
+        self.leaf_public_keys = []
+        self.party_shares = {pid: {} for pid in range(self.parties)}
+        self.used_leaves = set()
+
+        for _ in range(self.num_leaves):
             sk, pk = self.generate_lamport_keypair()
             self.leaf_secret_keys.append(sk)
             self.leaf_public_keys.append(pk)
@@ -406,194 +417,96 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             leaf_hashes.append(pk.leaf_hash(self))
 
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
-        self.build_threshold_shares()
+        self.assign_leaves_to_subsets()
+        self.build_subset_xor_shares()
 
         self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
 
-    def field_add(self, a, b):
-        return (a + b) % self.field_prime
-    
-    def field_sub(self, a, b):
-        return (a - b) % self.field_prime
-    
-    def field_mul(self, a, b):
-        return (a * b) % self.field_prime
-    
-    def field_inv(self, a):
-        if a % self.field_prime == 0:
-            raise ZeroDivisionError("cannot invert zero in finite field")
-        return pow(a, -1, self.field_prime)
-    
-    def eval_polynomial(self, coeffs, x):
-        result = 0
-        for coeff in reversed(coeffs):
-            result = self.field_add(self.field_mul(result, x), coeff)
-        return result
-    
-    def shamir_share_byte(self, secret_value, n, k):
-        if secret_value < 0 or secret_value >= self.field_prime:
-            raise ValueError("secret byte out of field range")
+    def assign_leaves_to_subsets(self):
+        subset_count = len(self.subset_parties)
+        base = self.num_leaves // subset_count
+        extra = self.num_leaves % subset_count
+        if base == 0:
+            raise ValueError("not enough leaves to assign at least one leaf to each subset")
         
-        coeffs = [secret_value]
-        for i in range(k - 1):
-            coeffs.append(secrets.randbelow(self.field_prime))
-
-        shares = []
-        for x in range(1, n + 1):
-            y = self.eval_polynomial(coeffs, x)
-            shares.append(y)
-
-        return shares
+        self.subset_leaf_ranges = {}
+        self.leaf_to_subset = {}
+        cursor = 0
+        for index, subset in enumerate(self.subset_parties):
+            count = base + (1 if index < extra else 0)
+            start = cursor
+            end = cursor + count - 1
+            self.subset_leaf_ranges[subset] = (start, end)
+            for leaf_index in range(start, end + 1):
+                self.leaf_to_subset[leaf_index] = subset
+            cursor = end + 1
     
-    def shamir_share(self, secret_bytes, n, k):
-        party_vectors = []
-        for i in range(n):
-            party_vectors.append([])
-
-        for b in secret_bytes:
-            byte_shares = self.shamir_share_byte(b, n, k)
-            for party_index in range(n):
-                party_vectors[party_index].append(byte_shares[party_index])
-
-        return party_vectors
-    
-    def lagrange_interpolate_at_zero(self, points):
-        total = 0
-
-        for i in range(len(points)):
-            xi, yi = points[i]
-            numerator = 1
-            denominator = 1
-
-            for j in range(len(points)):
-                if i == j:
-                    continue
-
-                xj, yj = points[j]
-                numerator = self.field_mul(numerator, (-xj) % self.field_prime)
-                denominator = self.field_mul(denominator, (xi - xj) % self.field_prime)
-
-            li = self.field_mul(numerator, self.field_inv(denominator))
-            total = self.field_add(total, self.field_mul(yi, li))
-
-        return total
-    
-    def shamir_recombine(self, share_points):
-        if len(share_points) < self.threshold_k:
-            raise ValueError("not enough shares to reconstruct")
-        
-        share_length = len(share_points[0][1])
-
-        for x, share_vec in share_points:
-            if len(share_vec) != share_length:
-                raise ValueError("inconsistent share vector length")
-            
-        recovered = []
-
-        for byte_index in range(share_length):
-            points_for_one_byte = []
-            for x, share_vec in share_points[:self.threshold_k]:
-                points_for_one_byte.append((x, share_vec[byte_index]))
-
-            secret_value = self.lagrange_interpolate_at_zero(points_for_one_byte)
-
-            if secret_value < 0 or secret_value > 255:
-                raise ValueError("reconstructed byte out of byte range")
-            
-            recovered.append(secret_value)
-
-        return bytes(recovered)
-    
-    def build_threshold_shares(self):
-        for leaf_index in range(len(self.leaf_secret_keys)):
-            lamport_sk = self.leaf_secret_keys[leaf_index]
+    def build_subset_xor_shares(self):
+        for leaf_index, lamport_sk in enumerate(self.leaf_secret_keys):
+            subset = self.leaf_to_subset[leaf_index]
 
             for pid in range(self.parties):
                 self.party_shares[pid][leaf_index] = {}
 
             for bit_index in range(self.lamport_bits):
-                shares_zero = self.shamir_share(lamport_sk[0][bit_index], self.parties, self.threshold_k,)
-                shares_one = self.shamir_share(lamport_sk[1][bit_index], self.parties, self.threshold_k,)
+                shares_zero = self.xor_share(lamport_sk[0][bit_index], len(subset),)
+                shares_one = self.xor_share(lamport_sk[1][bit_index], len(subset),)
                 
-                for pid in range(self.parties):
+                for local_idx, pid in enumerate(subset):
                     self.party_shares[pid][leaf_index][bit_index] = {
-                        0: shares_zero[pid],
-                        1: shares_one[pid],
+                        0: shares_zero[local_idx],
+                        1: shares_one[local_idx],
                     }
 
+    def normalise_subset(self, active_party_ids):
+        if active_party_ids is None:
+            active_party_ids = list(range(self.threshold_k))
+        unique_ids = []
+        for pid in active_party_ids:
+            if pid < 0 or pid >= self.parties:
+                raise ValueError("invalid party id in active_party_ids")
+            if pid not in unique_ids:
+                unique_ids.append(pid)
+        if len(unique_ids) != self.threshold_k:
+            raise ValueError("extension 1 expects exactly k active parties for a k-of-k subtree")
+        return tuple(sorted(unique_ids))
+    
+    def next_unused_leaf_for_subset(self, subset):
+        start, end = self.subset_leaf_ranges[subset]
+        for leaf_index in range(start, end + 1):
+            if leaf_index not in self.used_leaves:
+                return leaf_index
+        return None
+
     def party_produce_share(self, party_id, leaf_index, message):
-        if not self.approve(party_id, message):
-            raise PermissionError("party " + str(party_id) + " refused to sign")
-        
-        if party_id not in self.party_shares:
-            raise KeyError("unknown party id")
-        if leaf_index not in self.party_shares[party_id]:
-            raise IndexError("unknown leaf index")
-        
-        bits = self.bytes_to_bits(self.H(message))
-        selected_shares = []
-
-        for bit_index in range(len(bits)):
-            bit = bits[bit_index]
-            selected_shares.append(self.party_shares[party_id][leaf_index][bit_index][bit])
-
-        return ShareResponse(party_id=party_id, leaf_index=leaf_index, selected_shares=selected_shares,)
+        subset = self.leaf_to_subset[leaf_index]
+        if party_id not in subset:
+            raise PermissionError("party is not a member of the selected k-of-k subtree")
+        return super().party_produce_share(party_id, leaf_index, message,)
     
     def sign(self, message, leaf_index=None, active_party_ids=None):
+        subset = self.normalise_subset(active_party_ids)
+        if subset not in self.subset_leaf_ranges:
+            raise PermissionError("no subtree exists for the selected active parties")
         if leaf_index is None:
-            leaf_index = self.next_unused_leaf()
-
+            leaf_index = self.next_unused_leaf_for_subset(subset)
         if leaf_index is None:
             raise RuntimeError("all Lamport leaves are exhausted")
+        if self.leaf_to_subset[leaf_index] != subset:
+            raise PermissionError("leaf does not belong to the requested subtree")
         if leaf_index in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
-        
-        if active_party_ids is None:
-            candidate_ids = []
-            for pid in range(self.parties):
-                candidate_ids.append(pid)
-        else:
-            candidate_ids = []
-            for pid in active_party_ids:
-                if pid < 0 or pid >= self.parties:
-                    raise ValueError("invalid party id in active_party_ids")
-                if pid not in candidate_ids:
-                    candidate_ids.append(pid)
 
         share_responses = []
-
-        for pid in candidate_ids:
-            try:
-                resp = self.party_produce_share(pid, leaf_index, message)
-                share_responses.append(resp)
-            except PermissionError:
-                pass
-
-            if len(share_responses) == self.threshold_k:
-                break
-
-        if len(share_responses) < self.threshold_k:
-            raise PermissionError("fewer than k parties approved the message")
-        
-        bit_count = len(share_responses[0].selected_shares)
-
-        for resp in share_responses:
-            if resp.leaf_index != leaf_index:
-                raise ValueError("inconsistent leaf index in responses")
-            if len(resp.selected_shares) != bit_count:
-                raise ValueError("inconsistent share count in responses")
+        for pid in subset:
+            resp = self.party_produce_share(pid, leaf_index, message)
+            share_responses.append(resp)
             
         reconstructed_revealed = []
 
-        for bit_index in range(bit_count):
-            share_points = []
-            
-            for resp in share_responses:
-                x_coordinate = resp.party_id + 1
-                share_vector = resp.selected_shares[bit_index]
-                share_points.append((x_coordinate, share_vector))
-
-            reconstructed_revealed.append(self.shamir_recombine(share_points))
+        for bit_index in range(len(share_responses[0].selected_shares)):
+            position_shares = [resp.selected_shares[bit_index] for resp in share_responses]
+            reconstructed_revealed.append(self.xor_recombine(position_shares))
 
         self.used_leaves.add(leaf_index)
 
@@ -603,6 +516,7 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
         setup_times = []
         sign_times = []
         verify_times = []
+        active_party_ids = list(range(self.threshold_k))
 
         for i in range(rounds):
             message = ("benchmark-message-" + str(i)).encode()
@@ -611,7 +525,7 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             scheme = KOfNThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height,)
             t1 = time.perf_counter()
 
-            sig = scheme.sign(message)
+            sig = scheme.sign(message, active_party_ids=active_party_ids)
             t2 = time.perf_counter()
 
             ok = scheme.verify(sig)
@@ -634,16 +548,28 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             "verify_time": round(statistics.mean(verify_times), 8),
         }
     
-# Extension 2: distributed threshold signing
-# simulates local agreement between parties
-# uses helper strings and session IDs     
+# Extension 2: 
+# the untrusted server only looks up helper strings
+# each party derives its own share locally using a hash-based PRF-like method
+# the dealer keeps only one correction share
 class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
         self.helper_strings = {}
+        self.party_prf_seeds = {}
+        self.dealer_correction_shares = {}
         super().__init__(parties, threshold_k, tree_height, approval_policies)
 
     def dealer_setup(self):
-        for i in range(self.num_leaves):
+        subset_count = len(self.subset_parties)
+        if self.num_leaves < subset_count:
+            raise ValueError("tree_height is too small for all k-of-k subtrees")
+        
+        self.leaf_secret_keys = []
+        self.leaf_public_keys = []
+        self.party_shares = {pid: {} for pid in range(self.parties)}
+        self.used_leaves = set()
+
+        for _ in range(self.num_leaves):
             sk, pk = self.generate_lamport_keypair()
             self.leaf_secret_keys.append(sk)
             self.leaf_public_keys.append(pk)
@@ -653,42 +579,55 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             leaf_hashes.append(pk.leaf_hash(self))
 
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
-        self.build_threshold_shares()
+        self.assign_leaves_to_subsets()
         self.build_helper_strings()
+        self.build_prf_based_shares()
 
         self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
 
     def build_helper_strings(self):
         self.helper_strings = {}
+        self.party_prf_seeds = {pid: self.randbytes(32) for pid in range(self.parties)}
 
         for pid in range(self.parties):
             self.helper_strings[pid] = {}
             for leaf_index in range(self.num_leaves):
                 self.helper_strings[pid][leaf_index] = self.randbytes(16)
 
+    def prf_share(self, party_id, leaf_index, bit_index, bit_value):
+        seed = self.party_prf_seeds[party_id]
+        helper = self.helper_strings[party_id][leaf_index]
+
+        return self.h_tag(b"party-prf-share", seed, helper, leaf_index.to_bytes(4, "big"), bit_index.to_bytes(4, "big"), bit_value.to_bytes(1, "big"),)
+    
+    def build_prf_based_shares(self):
+        self.dealer_correction_shares = {}
+        for leaf_index, lamport_sk in enumerate(self.leaf_secret_keys):
+            subset = self.leaf_to_subset[leaf_index]
+            self.dealer_correction_shares[leaf_index] = {}
+            for bit_index in range(self.lamport_bits):
+                self.dealer_correction_shares[leaf_index][bit_index] = {}
+                for bit_value in (0, 1):
+                    secret_value = lamport_sk[bit_value][bit_index]
+                    party_parts = [self.prf_share(pid, leaf_index, bit_index, bit_value) for pid in subset]
+                    dealer_part = self.xor_bytes([secret_value] + party_parts)
+                    self.dealer_correction_shares[leaf_index][bit_index][bit_value] = dealer_part
+
     def lookup_helper_strings(self, leaf_index, signer_ids):
-        if leaf_index < 0 or leaf_index >= self.num_leaves:
-            raise IndexError("leaf index out of range")
-        
+        subset = self.leaf_to_subset[leaf_index]
         lookup = {}
         for pid in signer_ids:
-            if pid < 0 or pid >= self.parties:
-                raise ValueError("invalid party id")
+            if pid not in subset:
+                raise PermissionError("party is not part of the selected subtree")
             lookup[pid] = self.helper_strings[pid][leaf_index]
-
         return lookup
     
     def build_session_id(self, message, leaf_index, signer_ids, helper_lookup):
-        parts = [b"distributed-session"]
-        parts.append(message)
-        parts.append(str(leaf_index).encode())
-
-        signer_ids_sorted = sorted(signer_ids)
-        for pid in signer_ids_sorted:
-            parts.append(str(pid).encode())
+        parts = [message, leaf_index.to_bytes(4, "big")]
+        for pid in sorted(signer_ids):
+            parts.append(pid.to_bytes(2, "big"))
             parts.append(helper_lookup[pid])
-
-        return self.h_tag(b"session-id", *parts)
+        return self.h_tag(b"distributed-session", *parts)
     
     def party_agree_session(self, party_id, message, leaf_index, signer_ids, helper_lookup):
         if party_id not in signer_ids:
@@ -700,55 +639,26 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         return self.build_session_id(message, leaf_index, signer_ids, helper_lookup)
     
     def create_signing_session(self, message, signer_ids, leaf_index=None):
+        subset = self.normalise_subset(signer_ids)
         if leaf_index is None:
-            leaf_index = self.next_unused_leaf()
+            leaf_index = self.next_unused_leaf_for_subset(subset)
 
         if leaf_index is None:
-            raise RuntimeError("all Lamport leaves are exhausted")
+            raise RuntimeError("all leaves for the selected k-of-k subtree are exhausted")
         
-        if leaf_index in self.used_leaves:
-            raise RuntimeError("leaf already used; one-time key reuse is forbidden")
-        
-        if signer_ids is None:
-            raise ValueError("signer_ids must be provided for distributed signing")
-        
-        unique_signer_ids = []
-        for pid in signer_ids:
-            if pid < 0 or pid >= self.parties:
-                raise ValueError("invalid party id in signer_ids")
-            if pid not in unique_signer_ids:
-                unique_signer_ids.append(pid)
+        helper_lookup = self.lookup_helper_strings(leaf_index, subset)
 
-        if len(unique_signer_ids) < self.threshold_k:
-            raise ValueError("fewer than k signer ids were provided")
+        session_ids = [self.party_agree_session(pid, message, leaf_index, subset, helper_lookup) for pid in subset]
         
-        helper_lookup = self.lookup_helper_strings(leaf_index, unique_signer_ids)
-
-        session_ids = []
-        approved_signers = []
-
-        for pid in unique_signer_ids:
-            try:
-                sid = self.party_agree_session(pid, message, leaf_index, unique_signer_ids, helper_lookup)
-                session_ids.append(sid)
-                approved_signers.append(pid)
-            except PermissionError:
-                pass
-
-        if len(approved_signers) < self.threshold_k:
-            raise PermissionError("fewer than k parties approved the distributed signing session")
-        
-        first_sid = session_ids[0]
-        for sid in session_ids:
-            if sid != first_sid:
-                raise RuntimeError("parties did not agree on the same session id")
+        if len(set(session_ids)) != 1:
+            raise RuntimeError("parties did not agree on the same session id")
             
         session = {
             "message": message,
             "leaf_index": leaf_index,
-            "signer_ids": approved_signers,
+            "signer_ids": subset,
             "helper_lookup": helper_lookup,
-            "session_id": first_sid,
+            "session_id": session_ids[0],
         }
 
         return session
@@ -763,42 +673,21 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if leaf_index in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
         
-        share_responses = []
-        
         for pid in signer_ids:
             recomputed_sid = self.party_agree_session(pid, message, leaf_index, signer_ids, helper_lookup)
             if recomputed_sid != session_id:
                 raise RuntimeError("session id mismatch during signing")
             
-            resp = self.party_produce_share(pid, leaf_index, message)
-            share_responses.append(resp)
-
-        if len(share_responses) < self.threshold_k:
-            raise PermissionError("fewer than k valid shares collected")
-        
-        bit_count = len(share_responses[0].selected_shares)
-        
-        for resp in share_responses:
-            if resp.leaf_index != leaf_index:
-                raise ValueError("inconsistent leaf index in responses")
-            if len(resp.selected_shares) != bit_count:
-                raise ValueError("inconsistent share count in responses")
-            
-        reconstructed_revealed = []
-
-        for bit_index in range(bit_count):
-            share_points = []
-
-            for resp in share_responses:
-                x_coordinate = resp.party_id + 1
-                share_vector = resp.selected_shares[bit_index]
-                share_points.append((x_coordinate, share_vector))
-
-            reconstructed_revealed.append(self.shamir_recombine(share_points))
+        bits = self.bytes_to_bits(self.H(message))
+        revealed = []
+        for bit_index, bit in enumerate(bits):
+            dealer_part = self.dealer_correction_shares[leaf_index][bit_index][bit]
+            party_parts = [self.prf_share(pid, leaf_index, bit_index, bit) for pid in signer_ids]
+            revealed.append(self.xor_bytes([dealer_part] + party_parts))
 
         self.used_leaves.add(leaf_index)
 
-        return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=reconstructed_revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+        return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
     
     def sign(self, message, leaf_index=None, signer_ids=None):
         session = self.create_signing_session(message=message, signer_ids=signer_ids, leaf_index=leaf_index,)
@@ -809,6 +698,7 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         setup_times = []
         sign_times = []
         verify_times = []
+        signer_ids = list(range(self.threshold_k))
 
         for i in range(rounds):
             message = ("benchmark-message-" + str(i)).encode()
@@ -816,10 +706,6 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             t0 = time.perf_counter()
             scheme = DistributedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height,)
             t1 = time.perf_counter()
-
-            signer_ids = []
-            for pid in range(self.threshold_k):
-                signer_ids.append(pid)
 
             sig = scheme.sign(message, signer_ids=signer_ids)
             t2 = time.perf_counter()
@@ -845,44 +731,52 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         }
 
 # Extension 3: batched signing
-# supports signing multiple messages in one call
-# improves throughput
+# use Merkle trees on buffered messages and sign the batch root once
 class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
-    def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
-        super().__init__(parties, threshold_k, tree_height, approval_policies)
-
-    def sign_batch(self, messages, active_party_ids=None, start_leaf_index=None):
-        if messages is None or len(messages) == 0:
-            raise ValueError("messages must be a non-empty list")
-        
-        signatures = []
-
-        if start_leaf_index is None:
-            current_leaf = self.next_unused_leaf()
-        else:
-            current_leaf = start_leaf_index
-
-        if current_leaf is None:
-            raise RuntimeError("all Lamport leaves are exhausted")
-        
-        for message in messages:
-            if current_leaf is None:
-                raise RuntimeError("not enough remaining leaves for batch signing")
-            
-            sig = self.sign(message=message, leaf_index=current_leaf, active_party_ids=active_party_ids,)
-            signatures.append(sig)
-
-            current_leaf += 1
-            if current_leaf >= self.num_leaves:
-                current_leaf = None
-
-        return signatures
+    def batch_message_leaf(self, message):
+        return self.h_tag(b"batch_message", message)
     
-    def verify_batch(self, signatures):
-        results = []
+    def build_batch_tree(self, messages):
+        if not messages:
+            raise ValueError("messages must be a non-empty list")
+        leaves = [self.batch_message_leaf(m) for m in messages]
+        n = 1
+        while n < len(leaves):
+            n *= 2
+        while len(leaves) < n:
+            leaves.append(self.h_tag(b"batch-pad", len(leaves).to_bytes(4, "big")))
+        return self.build_merkle_tree(leaves)
+    
+    def get_batch_auth_path(self, levels, leaf_index):
+        idx = leaf_index
+        siblings = []
+        directions = []
+        for level in levels[:-1]:
+            if idx % 2 == 0:
+                sibling_index = idx + 1
+                directions.append(0)
+            else:
+                sibling_index = idx - 1
+                directions.append(1)
+            siblings.append(level[sibling_index])
+            idx //= 2
+        return MerklePath(siblings, directions)
 
-        for sig in signatures:
-            results.append(self.verify(sig))
+    def sign_batch(self, messages, active_party_ids=None, leaf_index=None):
+        levels = self.build_batch_tree(messages)
+        batch_root = levels[-1][0]
+        root_signature = super().sign(batch_root, leaf_index=leaf_index, active_party_ids=active_party_ids)
+        batch_paths = [self.get_batch_auth_path(levels, i) for i in range(len(messages))]
+        return BatchThresholdSignature(root_signature, messages, batch_paths, batch_root)
+    
+    def verify_batch(self, batch_signature, public_bundle=None):
+        results = []
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+        root_ok = self.verify(batch_signature.batch_root_signature, message=batch_signature.batch_root, public_bundle=public_bundle)
+        for message, path in zip(batch_signature.messages, batch_signature.batch_paths):
+            msg_leaf = self.batch_message_leaf(message)
+            path_ok = self.verify_merkle_path(msg_leaf, path, batch_signature.batch_root)
+            results.append(root_ok and path_ok)
 
         return results
     
@@ -890,6 +784,7 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
         setup_times = []
         batch_sign_times = []
         verify_times = []
+        signer_ids = list(range(self.threshold_k))
 
         for i in range(rounds):
             messages = []
@@ -900,18 +795,13 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
             scheme = BatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height,)
             t1 = time.perf_counter()
 
-            sigs = scheme.sign_batch(messages=messages, active_party_ids=list(range(self.threshold_k)))
+            sig = scheme.sign_batch(messages=messages, active_party_ids=signer_ids)
             t2 = time.perf_counter()
 
-            verify_ok = True
-            verify_results = scheme.verify_batch(sigs)
-            for item in verify_results:
-                if not item:
-                    verify_ok = False
-                    break
+            verify_results = scheme.verify_batch(sig)
             t3 = time.perf_counter()
 
-            if not verify_ok:
+            if not all(verify_results):
                 raise RuntimeError("batch benchmark produced invalid signature")
             
             setup_times.append(t1 - t0)
@@ -930,9 +820,8 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
             "avg_sign_time_per_message": round(statistics.mean(batch_sign_times) / batch_size, 8),
         }
     
-# Extension 4: hierarchical subtree-based batch signing
-# organises leaves into subtrees
-# performs batch signing within a subtree
+# Extension 4: 
+# use Merkle trees within higher layers while leaving leaves as Lamport nodes
 class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, subtree_height=2, approval_policies=None):
         if subtree_height < 1:
@@ -942,14 +831,21 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
         
         self.subtree_height = subtree_height
         self.subtree_size = 2 ** subtree_height
-        self.num_subtrees = self.num_subtrees_placeholder(tree_height, subtree_height)
-
+        
         super().__init__(parties, threshold_k, tree_height, approval_policies)
+        self.build_hierarchical_views()
 
-    def num_subtrees_placeholder(self, tree_height, subtree_height):
-        total_leaves = 2 ** tree_height
-        subtree_size = 2 ** subtree_height
-        return total_leaves // subtree_size
+    def build_hierarchical_views(self):
+        self.subtree_roots = []
+        self.upper_levels = []
+        total_subtrees = self.num_leaves // self.subtree_size
+        for subtree_index in range(total_subtrees):
+            start = subtree_index * self.subtree_size
+            end = start + self.subtree_size
+            subtree_leaf_hashes = [self.leaf_public_keys[i].leaf_hash(self) for i in range(start, end)]
+            subtree_levels = self.build_merkle_tree(subtree_leaf_hashes)
+            self.subtree_roots.append(subtree_levels[-1][0])
+        self.upper_levels = self.build_merkle_tree(self.subtree_roots)
     
     def get_subtree_index(self, leaf_index):
         if leaf_index < 0 or leaf_index >= self.num_leaves:
@@ -957,86 +853,86 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
         return leaf_index // self.subtree_size
     
     def get_subtree_leaf_range(self, subtree_index):
-        if subtree_index < 0 or subtree_index >= self.num_subtrees:
-            raise IndexError("subtree index out of range")
-        
         start_leaf = subtree_index * self.subtree_size
         end_leaf = start_leaf + self.subtree_size - 1
         return start_leaf, end_leaf
     
-    def next_unused_leaf_in_subtree(self, subtree_index):
+    def next_unused_leaf_in_subtree(self, subtree_index, subset=None):
         start_leaf, end_leaf = self.get_subtree_leaf_range(subtree_index)
 
         for leaf_index in range(start_leaf, end_leaf + 1):
+            if subset is not None and self.leaf_to_subset[leaf_index] != subset:
+                continue
             if leaf_index not in self.used_leaves:
                 return leaf_index
             
         return None
     
-    def next_available_subtree(self):
-        for subtree_index in range(self.num_subtrees):
-            candidate = self.next_unused_leaf_in_subtree(subtree_index)
-            if candidate is not None:
-                return subtree_index
-        return None
+    def get_hierarchical_auth_path(self, leaf_index):
+        subtree_index = self.get_subtree_index(leaf_index)
+        start_leaf, _ = self.get_subtree_leaf_range(subtree_index)
+        local_index = leaf_index - start_leaf
+
+        subtree_leaf_hashes = [self.leaf_public_keys[i].leaf_hash(self) for i in range(start_leaf, start_leaf + self.subtree_size)]
+        local_levels = self.build_merkle_tree(subtree_leaf_hashes)
+        local_path = self.get_batch_auth_path(local_levels, local_index)
+        upper_path = self.get_batch_auth_path(self.upper_levels, subtree_index)
+        return HierarchicalMerklePath(local_path, upper_path, subtree_index)
+    
+    def verify_hierarchical_path(self, leaf_hash, auth_path, expected_root):
+        subtree_root_ok = self.verify_merkle_path(leaf_hash, auth_path.local_path, self.subtree_roots[auth_path.subtree_index])
+        if not subtree_root_ok:
+            return False
+        return self.verify_merkle_path(self.subtree_roots[auth_path.subtree_index], auth_path.upper_path, expected_root)
+    
+    def sign(self, message, leaf_index=None, active_party_ids=None):
+        sig = super().sign(message, leaf_index=leaf_index, active_party_ids=active_party_ids)
+        sig.auth_path = self.get_hierarchical_auth_path(sig.leaf_index)
+        return sig
+    
+    def verify(self, signature, message=None, public_bundle=None):
+        message = signature.message if message is None else message
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+        if not self.verify_lamport_signature(message, signature.revealed, signature.lamport_public_key):
+            return False
+        leaf_hash = signature.lamport_public_key.leaf_hash(self)
+        if isinstance(signature.auth_path, HierarchicalMerklePath):
+            return self.verify_hierarchical_path(leaf_hash, signature.auth_path, public_bundle.merkle_root)
+        return self.verify_merkle_path(leaf_hash, signature.auth_path, public_bundle.merkle_root)
     
     def sign_batch_in_subtree(self, messages, active_party_ids=None, subtree_index=None):
-        if messages is None or len(messages) == 0:
-            raise ValueError("messages must be a non-empty list")
+        subset = self.normalise_subset(active_party_ids)
         
         if subtree_index is None:
-            subtree_index = self.next_available_subtree()
+            for candidate in range(self.num_leaves // self.subtree_size):
+                if self.next_unused_leaf_in_subtree(candidate, subset=subset) is not None:
+                    subtree_index = candidate
+                    break
 
         if subtree_index is None:
             raise RuntimeError("no subtree with available leaves")
         
-        signatures = []
-        used_leaf_indices = []
-
-        current_leaf = self.next_unused_leaf_in_subtree(subtree_index)
-
-        if current_leaf is None:
-            raise RuntimeError("selected subtree has no available leaves")
+        leaf_index = self.next_unused_leaf_in_subtree(subtree_index, subset=subset)
+        if leaf_index is None:
+            raise RuntimeError("selected subtree has no compatible unused leaf")
         
-        start_leaf, end_leaf = self.get_subtree_leaf_range(subtree_index)
-
-        for message in messages:
-            if current_leaf is None or current_leaf > end_leaf:
-                raise RuntimeError("not enough remaining leaves inside selected subtree")
-            
-            sig = self.sign(message=message, leaf_index=current_leaf, active_party_ids=active_party_ids,)
-
-            signatures.append(sig)
-            used_leaf_indices.append(current_leaf)
-
-            next_leaf = None
-            for candidate in range(current_leaf + 1, end_leaf + 1):
-                if candidate not in self.used_leaves:
-                    next_leaf = candidate
-                    break
-
-            current_leaf = next_leaf
+        batch_sig = self.sign_batch(messages, active_party_ids=list(subset), leaf_index=leaf_index)
 
         return {
             "subtree_index": subtree_index,
-            "subtree_leaf_range": (start_leaf, end_leaf),
-            "used_leaf_indices": used_leaf_indices,
-            "signatures": signatures,
+            "subtree_leaf_range": self.get_subtree_leaf_range(subtree_index),
+            "used_leaf_indices": [leaf_index],
+            "batch_signature": batch_sig,
         }
     
     def verify_subtree_batch(self, batch_result):
-        signatures = batch_result["signatures"]
-        results = []
-
-        for sig in signatures:
-            results.append(self.verify(sig))
-
-        return results
+        return self.verify_batch(batch_result["batch_signature"])
     
     def benchmark_hierarchical_batch(self, rounds, batch_size):
         setup_times = []
         batch_sign_times = []
         verify_times = []
+        signer_ids = list(range(self.threshold_k))
 
         for i in range(rounds):
             messages = []
@@ -1047,18 +943,13 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
             scheme = HierarchicalBatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height, self.subtree_height,)
             t1 = time.perf_counter()
 
-            batch_result = scheme.sign_batch_in_subtree(messages=messages, active_party_ids=list(range(self.threshold_k)))
+            batch_result = scheme.sign_batch_in_subtree(messages, active_party_ids=signer_ids)
             t2 = time.perf_counter()
 
-            verify_ok = True
             verify_results = scheme.verify_subtree_batch(batch_result)
-            for item in verify_results:
-                if not item:
-                    verify_ok = False
-                    break
             t3 = time.perf_counter()
 
-            if not verify_ok:
+            if not all(verify_results):
                 raise RuntimeError("hierarchical batch benchmark produced invalid signature")
             
             setup_times.append(t1 - t0)
@@ -1078,18 +969,14 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
             "avg_sign_time_per_message": round(statistics.mean(batch_sign_times) / batch_size, 8),
         }
     
-# Extension 5: Winternitz-based threshold hash signatures
-# replaces Lamport OTS with Winternitz OTS
-# reduces signature size
+# Extension 5: 
+# add support for Winternitz while keeping the threshold subtree structure
 class WinternitzPublicKey:
     def __init__(self, pub):
         self.pub = pub
 
     def leaf_hash(self, scheme):
-        flat = []
-        for item in self.pub:
-            flat.append(item)
-        return scheme.h_tag(b"winternitz-leaf", *flat)
+        return scheme.h_tag(b"winternitz-leaf", *self.pub)
     
 class WinternitzThresholdSignature:
     def __init__(self, leaf_index, message, revealed, public_key, auth_path):
@@ -1141,7 +1028,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
     
     def hash_iter(self, data, count):
         out = data
-        for i in range(count):
+        for _ in range(count):
             out = self.H(out)
         return out
     
@@ -1198,7 +1085,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         sk = []
         pk = []
 
-        for i in range(self.num_chains):
+        for _ in range(self.num_chains):
             x = self.randbytes(self.digest_size)
             sk.append(x)
             pk.append(self.hash_iter(x, self.w -1))
@@ -1206,10 +1093,15 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         return sk, WinternitzPublicKey(pk)
     
     def dealer_setup(self):
+        subset_count = len(self.subset_parties)
+        if self.num_leaves < subset_count:
+            raise ValueError("tree_height is too small for all k-of-k subtrees")
         self.leaf_secret_keys = []
         self.leaf_public_keys = []
+        self.party_shares = {pid: {} for pid in range(self.parties)}
+        self.used_leaves = set()
 
-        for i in range(self.num_leaves):
+        for _ in range(self.num_leaves):
             sk, pk = self.generate_winternitz_keypair()
             self.leaf_secret_keys.append(sk)
             self.leaf_public_keys.append(pk)
@@ -1219,106 +1111,72 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             leaf_hashes.append(pk.leaf_hash(self))
 
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
+        self.assign_leaves_to_subsets()
         self.build_winternitz_threshold_shares()
 
         self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
 
     def build_winternitz_threshold_shares(self):
-        for leaf_index in range(len(self.leaf_secret_keys)):
-            winternitz_sk = self.leaf_secret_keys[leaf_index]
+        for leaf_index, winternitz_sk in enumerate(self.leaf_secret_keys):
+            subset = self.leaf_to_subset[leaf_index]
 
             for pid in range(self.parties):
                 self.party_shares[pid][leaf_index] = {}
 
             for chain_index in range(self.num_chains):
-                shares = self.shamir_share(
+                shares = self.xor_share(
                     winternitz_sk[chain_index],
-                    self.parties,
-                    self.threshold_k,
+                    len(subset),
                 )
 
-                for pid in range(self.parties):
-                    self.party_shares[pid][leaf_index][chain_index] = shares[pid]
+                for local_idx, pid in enumerate(subset):
+                    self.party_shares[pid][leaf_index][chain_index] = shares[local_idx]
 
     def party_produce_share(self, party_id, leaf_index, message):
+        subset = self.leaf_to_subset[leaf_index]
+        if party_id not in subset:
+            raise PermissionError("party is not a member of the selected k-of-k subtree")
         if not self.approve(party_id, message):
             raise PermissionError("party " + str(party_id) + " refused to sign")
         
-        if party_id not in self.party_shares:
-            raise KeyError("unknown party id")
-        if leaf_index not in self.party_shares[party_id]:
-            raise IndexError("unknown leaf index")
-        
-        selected_shares = []
+        selected = []
 
         for chain_index in range(self.num_chains):
-            selected_shares.append(self.party_shares[party_id][leaf_index][chain_index])
+            selected.append(self.party_shares[party_id][leaf_index][chain_index])
         
-        return ShareResponse(party_id=party_id, leaf_index=leaf_index, selected_shares=selected_shares,)
+        return ShareResponse(party_id, leaf_index, selected,)
     
     def sign(self, message, leaf_index=None, active_party_ids=None):
+        subset = self.normalise_subset(active_party_ids)
         if leaf_index is None:
-            leaf_index = self.next_unused_leaf()
+            leaf_index = self.next_unused_leaf_for_subset(subset)
 
         if leaf_index is None:
             raise RuntimeError("all Winternitz leaves are exhausted")
         
+        if self.leaf_to_subset[leaf_index] != subset:
+            raise PermissionError("leaf does not belong to the requested subtree")
+        
         if leaf_index in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
-        
-        if active_party_ids is None:
-            candidate_ids = []
-            for pid in range(self.parties):
-                candidate_ids.append(pid)
-        else:
-            candidate_ids = []
-            for pid in active_party_ids:
-                if pid < 0 or pid >= self.parties:
-                    raise ValueError("invalid party id in active_party_ids")
-                if pid not in candidate_ids:
-                    candidate_ids.append(pid)
 
         share_responses = []
 
-        for pid in candidate_ids:
-            try:
-                resp = self.party_produce_share(pid, leaf_index, message)
-                share_responses.append(resp)
-            except PermissionError:
-                pass
-
-            if len(share_responses) == self.threshold_k:
-                break
-
-        if len(share_responses) < self.threshold_k:
-            raise PermissionError("fewer than k parties approved the message")
-        
-        chain_count = len(share_responses[0].selected_shares)
-
-        for resp in share_responses:
-            if resp.leaf_index != leaf_index:
-                raise ValueError("inconsistent leaf index in responses")
-            if len(resp.selected_shares) != chain_count:
-                raise ValueError("inconsistent share count in responses")
+        for pid in subset:
+            resp = self.party_produce_share(pid, leaf_index, message)
+            share_responses.append(resp)
             
         digits = self.message_digits_with_checksum(message)
-        reconstructed_revealed = []
+        revealed = []
 
-        for chain_index in range(chain_count):
-            share_points = []
-            
-            for resp in share_responses:
-                x_coordinate = resp.party_id + 1
-                share_vector = resp.selected_shares[chain_index]
-                share_points.append((x_coordinate, share_vector))
-
-            secret_element = self.shamir_recombine(share_points)
+        for chain_index in range(self.num_chains):
+            secret_element = self.xor_recombine([resp.selected_shares[chain_index] for resp in share_responses])
             signature_element = self.hash_iter(secret_element, digits[chain_index])
-            reconstructed_revealed.append(signature_element)
+            revealed.append(signature_element)
 
         self.used_leaves.add(leaf_index)
 
-        return WinternitzThresholdSignature(leaf_index=leaf_index, message=message, revealed=reconstructed_revealed, public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+        return WinternitzThresholdSignature(leaf_index=leaf_index, message=message, revealed=revealed, public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
     
     def verify_winternitz_signature(self, message, revealed, public_key):
         if len(revealed) != self.num_chains:
@@ -1327,26 +1185,26 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         digits = self.message_digits_with_checksum(message)
 
         for i in range(self.num_chains):
-            remaining = self.w - 1 - digits[i]
-            candidate = self.hash_iter(revealed[i], remaining)
-
-            if candidate != public_key.pub[i]:
+            if self.hash_iter(revealed[i], self.w - 1 - digits[i]) != public_key.pub[i]:
                 return False
             
         return True
     
-    def verify(self, signature):
-        ots_ok = self.verify_winternitz_signature(signature.message, signature.revealed, signature.public_key,)
+    def verify(self, signature, message=None, public_bundle=None):
+        message = signature.message if message is None else message
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+        ots_ok = self.verify_winternitz_signature(message, signature.revealed, signature.public_key,)
 
         if not ots_ok:
             return False
         
-        return self.verify_merkle_path(signature.public_key.leaf_hash(self), signature.auth_path, self.public_bundle.merkle_root,)
+        return self.verify_merkle_path(signature.public_key.leaf_hash(self), signature.auth_path, public_bundle.merkle_root,)
     
     def benchmark(self, rounds):
         setup_times = []
         sign_times = []
         verify_times = []
+        signer_ids = list(range(self.threshold_k))
 
         for i in range(rounds):
             message = ("benchmark-message-" + str(i)).encode()
@@ -1355,7 +1213,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             scheme = WinternitzThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height, self.w,)
             t1 = time.perf_counter()
 
-            sig = scheme.sign(message, active_party_ids=list(range(self.threshold_k)))
+            sig = scheme.sign(message, active_party_ids=signer_ids)
             t2 = time.perf_counter()
 
             ok = scheme.verify(sig)

@@ -12,11 +12,11 @@
 
 ## Extensions
 - This project includes five extensions beyond the minimal scheme
-- Extension 1: k-of-n Threshold Signing: implements a general k-of-n threshold scheme where only k out of n parties are required to produce a valid signature.
-- Extension 2: Distributed Threshold Signing: removes the fully trusted dealer assumption by simulating distributed key generation and signing behaviour.
-- Extension 3: Batched Signing: supports batch signing of multiple messages to improve throughput.
-- Extension 4: Hierarchical Batched Signing: introduces a hierarchical Merkle structure to further optimise batch signing performance.
-- Extension 5: Winternitz Optimization: replaces Lamport signatures with Winternitz signatures to reduce signature size and improve efficiency. 
+- Extension 1: k-of-n Threshold Signing: implements a k-of-n threshold scheme using a k-of-k subset-based (subtree-style) construction, where only k selected parties are required to produce a valid signature.
+- Extension 2: Distributed Threshold Signing: partially removes the fully trusted dealer assumption by introducing helper string lookup, allowing parties to locally derive shares using a hash-based PRF-like method, keeping only a correction share at the dealer.
+- Extension 3: Batched Signing: supports batch signing by buffering multiple messages into a Merkle tree, signing only the batch root, verifying individual messages using authentication paths.
+- Extension 4: Hierarchical Batched Signing: introduces a hierarchical Merkle structure: leaves remain Lamport nodes, upper layers are organised into subtree + upper tree, authentication paths become hierarchical.
+- Extension 5: Winternitz Optimization: replaces Lamport signatures with Winternitz signatures to reduce signature size, improve efficiency, while preserving the threshold structure. 
 
 ## Structure
 - `threshold_hbs.py`: core implementation of the scheme, including all schemes and extensions. 
@@ -38,24 +38,25 @@
     -- Demo: Minimal Threshold HBS --
     Verification result: True
 
-    -- Demo: Extension 1 (k-of-n Threshold HBS) --
+    -- Demo: Extension 1 (k-of-k subtrees for k-of-n) --
     Verification result: True
 
-    -- Demo: Extension 2 (Distributed Threshold HBS) --
+    -- Demo: Extension 2 (helper strings + peer decision) --
     Verification result: True
 
-    -- Demo: Extension 3 (Batched Threshold HBS) --
+    -- Demo: Extension 3 (Merkle-buffered batched signing) --
     Verification results: [True, True, True]
 
-    -- Demo: Extension 4 (Hierarchical Batched Threshold HBS) --
+    -- Demo: Extension 4 (Hierarchical higher layer Merkle trees) --
     Verification results: [True, True, True]
 
     -- Demo: Extension 5 (Winternitz Threshold HBS) --
     Verification result: True
 
-- The demo shows that all schemes produce valid signatures. The extensions introduce additional functionality such as threshold flexibility, distributed coordination, batching, hierarchical organisation, and signature size optimisation. 
+- The demo shows that all schemes produce valid signatures. Each extension successfully extends the minimal scheme with additional functionality, including threshold flexibility, distributed coordination, batching, hierarchical organisation, and signature size optimisation. 
 
 ### Benchmarks Output Explanation:
 
-- The benchmark results demonstrate the trade-offs between performance, scalability, and signature size across different extensions. 
+- The benchmark results demonstrate the trade-offs between number of parties, threshold size (k), and tree height across different extensions. 
+- Observations: Larger trees increase setup cost. Distributed version (Extension 2) introduces additional overhead. Batched signing (Extension 3 & 4) reduces per message signing cost. Winternitz (Extension 5) improves efficiency and reduces signature size. 
 
