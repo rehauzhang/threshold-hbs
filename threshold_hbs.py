@@ -27,18 +27,48 @@ class HierarchicalMerklePath:
         self.subtree_index = subtree_index
 
 class ThresholdSignature:
-    def __init__(self, leaf_index, message, revealed, lamport_public_key, auth_path):
-        self.leaf_index = leaf_index
+    def __init__(self, key_id=None, message=None, randomizer_R=None, revealed=None, lamport_public_key=None, auth_path=None, signer_ids=None, leaf_index=None):
+        if key_id is None:
+            key_id = leaf_index
+        if key_id is None:
+            raise ValueError("key_id or leaf_index must be provided")
+        self.key_id = key_id
+        # Keep the legacy leaf_index name for compatibility with the existing codebase.
+        self.leaf_index = key_id
         self.message = message
+        self.randomizer_R = b"" if randomizer_R is None else randomizer_R
         self.revealed = revealed
         self.lamport_public_key = lamport_public_key
         self.auth_path = auth_path
+        self.signer_ids = [] if signer_ids is None else signer_ids
 
 class ShareResponse:
     def __init__(self, party_id, leaf_index, selected_shares):
         self.party_id = party_id
         self.leaf_index = leaf_index
         self.selected_shares = selected_shares
+
+class Round1Response:
+    def __init__(self, party_id, key_id, r_share, chk_share):
+        self.party_id = party_id
+        self.key_id = key_id
+        self.r_share = r_share
+        self.chk_share = chk_share
+
+class Round2Response:
+    def __init__(self, party_id, key_id, selected_shares, auth_path):
+        self.party_id = party_id
+        self.key_id = key_id
+        self.selected_shares = selected_shares
+        self.auth_path = auth_path
+
+class SigningSession:
+    def __init__(self, message, key_id, signer_ids, helper_lookup, session_id):
+        self.message = message
+        self.key_id = key_id
+        self.signer_ids = signer_ids
+        self.helper_lookup = helper_lookup
+        self.session_id = session_id
 
 class PublicKeyBundle:
     def __init__(self, merkle_root, max_signatures, hash_name, leaves):
@@ -645,7 +675,8 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
         if leaf_index is None:
             raise RuntimeError("all leaves for the selected k-of-k subtree are exhausted")
-        
+
+        # In this prototype, KeyID is implemented as the Lamport leaf index.
         helper_lookup = self.lookup_helper_strings(leaf_index, subset)
 
         session_ids = [self.party_agree_session(pid, message, leaf_index, subset, helper_lookup) for pid in subset]
@@ -653,41 +684,123 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if len(set(session_ids)) != 1:
             raise RuntimeError("parties did not agree on the same session id")
             
-        session = {
-            "message": message,
-            "leaf_index": leaf_index,
-            "signer_ids": subset,
-            "helper_lookup": helper_lookup,
-            "session_id": session_ids[0],
-        }
-
-        return session
+        return SigningSession(
+            message=message,
+            key_id=leaf_index,
+            signer_ids=subset,
+            helper_lookup=helper_lookup,
+            session_id=session_ids[0],
+        )
     
-    def sign_with_session(self, session):
-        message = session["message"]
-        leaf_index = session["leaf_index"]
-        signer_ids = session["signer_ids"]
-        helper_lookup = session["helper_lookup"]
-        session_id = session["session_id"]
+    def run_round1(self, session):
+        responses = []
+        for pid in session.signer_ids:
+            responses.append(
+                self.party_round1_response(
+                    party_id=pid,
+                    key_id=session.key_id,
+                    message=session.message,
+                    signer_ids=session.signer_ids,
+                    helper_lookup=session.helper_lookup,
+                )
+            )
 
-        if leaf_index in self.used_leaves:
+        randomizer_R, combined_chk = self.combine_round1_responses(
+            responses,
+            message=session.message,
+            key_id=session.key_id,
+            signer_ids=session.signer_ids,
+        )
+
+        return {
+            "responses": responses,
+            "R": randomizer_R,
+            "chk": combined_chk,
+        }
+    
+    def party_round2_response(self, party_id, session, randomizer_R):
+        if party_id not in session.signer_ids:
+            raise PermissionError("party not selected for this signing session")
+
+        recomputed_sid = self.party_agree_session(
+            party_id,
+            session.message,
+            session.key_id,
+            session.signer_ids,
+            session.helper_lookup,
+        )
+        if recomputed_sid != session.session_id:
+            raise RuntimeError("session id mismatch during round 2")
+
+        bits = self.bytes_to_bits(self.H(session.message))
+        selected_shares = []
+        for bit_index, bit in enumerate(bits):
+            share = self.prf_share(party_id, session.key_id, bit_index, bit)
+            masked_share = self.h_tag(
+                b"round2-sig-share",
+                randomizer_R,
+                share,
+                bit_index.to_bytes(4, "big"),
+            )
+            selected_shares.append(masked_share)
+
+        return Round2Response(
+            party_id=party_id,
+            key_id=session.key_id,
+            selected_shares=selected_shares,
+            auth_path=self.get_auth_path(session.key_id),
+        )
+    
+    def assemble_signature(self, session, randomizer_R, round2_responses):
+        key_id = session.key_id
+
+        if key_id in self.used_leaves:
+            raise RuntimeError("leaf already used; one-time key reuse is forbidden")
+
+        if len(round2_responses) != len(session.signer_ids):
+            raise ValueError("missing round2 responses")
+
+        bits = self.bytes_to_bits(self.H(session.message))
+        revealed = []
+        for bit_index, bit in enumerate(bits):
+            dealer_part = self.dealer_correction_shares[key_id][bit_index][bit]
+            party_parts = [self.prf_share(pid, key_id, bit_index, bit) for pid in session.signer_ids]
+            revealed.append(self.xor_bytes([dealer_part] + party_parts))
+
+        self.used_leaves.add(key_id)
+
+        return ThresholdSignature(
+            key_id=key_id,
+            message=session.message,
+            randomizer_R=randomizer_R,
+            revealed=revealed,
+            lamport_public_key=self.leaf_public_keys[key_id],
+            auth_path=self.get_auth_path(key_id),
+            signer_ids=session.signer_ids,
+        )
+
+    def sign_with_session(self, session):
+        message = session.message
+        key_id = session.key_id
+        signer_ids = session.signer_ids
+        helper_lookup = session.helper_lookup
+        session_id = session.session_id
+
+        if key_id in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
         
         for pid in signer_ids:
-            recomputed_sid = self.party_agree_session(pid, message, leaf_index, signer_ids, helper_lookup)
+            recomputed_sid = self.party_agree_session(pid, message, key_id, signer_ids, helper_lookup)
             if recomputed_sid != session_id:
                 raise RuntimeError("session id mismatch during signing")
-            
-        bits = self.bytes_to_bits(self.H(message))
-        revealed = []
-        for bit_index, bit in enumerate(bits):
-            dealer_part = self.dealer_correction_shares[leaf_index][bit_index][bit]
-            party_parts = [self.prf_share(pid, leaf_index, bit_index, bit) for pid in signer_ids]
-            revealed.append(self.xor_bytes([dealer_part] + party_parts))
 
-        self.used_leaves.add(leaf_index)
+        round1 = self.run_round1(session)
+        randomizer_R = round1["R"]
+        round2_responses = []
+        for pid in signer_ids:
+            round2_responses.append(self.party_round2_response(pid, session, randomizer_R))
 
-        return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+        return self.assemble_signature(session, randomizer_R, round2_responses)
     
     def sign(self, message, leaf_index=None, signer_ids=None):
         session = self.create_signing_session(message=message, signer_ids=signer_ids, leaf_index=leaf_index,)
@@ -729,6 +842,51 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             "sign_time": round(statistics.mean(sign_times), 8),
             "verify_time": round(statistics.mean(verify_times), 8),
         }
+    def party_round1_response(self, party_id, key_id, message, signer_ids, helper_lookup):
+        if party_id not in signer_ids:
+            raise PermissionError("party not selected for this signing session")
+
+        if not self.approve(party_id, message):
+            raise PermissionError("party " + str(party_id) + " refused to sign")
+
+        helper = helper_lookup[party_id]
+        r_share = self.h_tag(
+            b"round1-r-share",
+            self.party_prf_seeds[party_id],
+            helper,
+            key_id.to_bytes(4, "big"),
+            message,
+        )
+        chk_share = self.h_tag(
+            b"round1-chk-share",
+            r_share,
+            party_id.to_bytes(2, "big"),
+            key_id.to_bytes(4, "big"),
+        )
+        return Round1Response(party_id, key_id, r_share, chk_share)
+    
+    def combine_round1_responses(self, round1_responses, message, key_id, signer_ids):
+        if len(round1_responses) != len(signer_ids):
+            raise ValueError("missing round1 responses")
+
+        ordered = sorted(round1_responses, key=lambda resp: resp.party_id)
+        r_parts = [resp.r_share for resp in ordered]
+        chk_parts = [resp.chk_share for resp in ordered]
+
+        randomizer_R = self.h_tag(
+            b"round1-randomizer",
+            message,
+            key_id.to_bytes(4, "big"),
+            *r_parts,
+        )
+        combined_chk = self.h_tag(
+            b"round1-check",
+            randomizer_R,
+            *chk_parts,
+        )
+        return randomizer_R, combined_chk
+
+
 
 # Extension 3: batched signing
 # use Merkle trees on buffered messages and sign the batch root once

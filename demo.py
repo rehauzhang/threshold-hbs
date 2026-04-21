@@ -32,11 +32,30 @@ def main():
     # Extension 2: (Distributed Signing)
     ext_scheme2 = DistributedThresholdHBSScheme(parties=4, threshold_k=3, tree_height=3)
     ext_message2 = b"extension 2 distributed threshold demo"
-    ext_signature2 = ext_scheme2.sign(ext_message2, signer_ids=[0, 2, 3])
+    ext_session2 = ext_scheme2.create_signing_session(
+        message=ext_message2,
+        signer_ids=[0, 2, 3],
+    )
+    ext_round1_2 = ext_scheme2.run_round1(ext_session2)
+    ext_round2_responses2 = []
+    for pid in ext_session2.signer_ids:
+        ext_round2_responses2.append(
+            ext_scheme2.party_round2_response(pid, ext_session2, ext_round1_2["R"])
+        )
+    ext_signature2 = ext_scheme2.assemble_signature(
+        ext_session2,
+        ext_round1_2["R"],
+        ext_round2_responses2,
+    )
 
-    print("-- Demo: Extension 2 (helper strings + peer decision) --")
+    print("-- Demo: Extension 2 (two-round distributed signing) --")
     print("Parties:", ext_scheme2.parties)
     print("Threshold k:", ext_scheme2.threshold_k)
+    print("Signer IDs:", ext_session2.signer_ids)
+    print("KeyID:", ext_session2.key_id)
+    print("Round 1 responses:", len(ext_round1_2["responses"]))
+    print("Round 1 randomizer R:", ext_round1_2["R"].hex()[:32] + "...")
+    print("Round 2 responses:", len(ext_round2_responses2))
     print("Leaf index used:", ext_signature2.leaf_index)
     print("Assigned subset:", ext_scheme2.leaf_to_subset[ext_signature2.leaf_index])
     print("Verification result:", ext_scheme2.verify(ext_signature2))
