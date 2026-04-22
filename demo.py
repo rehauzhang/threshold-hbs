@@ -24,6 +24,8 @@ def main():
     print("Parties:", ext_scheme1.parties)
     print("Threshold k:", ext_scheme1.threshold_k)
     print("Number of k-subtrees:", len(ext_scheme1.subset_parties))
+    print("KeyID:", ext_signature1.key_id)
+    print("Randomizer R:", ext_signature1.randomizer_R.hex()[:32] + "...")
     print("Leaf index used:", ext_signature1.leaf_index)
     print("Assigned subset:", ext_scheme1.leaf_to_subset[ext_signature1.leaf_index])
     print("Verification result:", ext_scheme1.verify(ext_signature1))
@@ -99,6 +101,8 @@ def main():
     print("Threshold k:", ext_scheme5.threshold_k)
     print("Winternitz w:", ext_scheme5.w)
     print("Number of chains:", ext_scheme5.num_chains)
+    print("KeyID:", ext_signature5.key_id)
+    print("Randomizer R:", ext_signature5.randomizer_R.hex()[:32] + "...")
     print("Leaf index used:", ext_signature5.leaf_index)
     print("Verification result:", ext_scheme5.verify(ext_signature5))
 

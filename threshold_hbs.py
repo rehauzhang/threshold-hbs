@@ -488,6 +488,29 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
                         1: shares_one[local_idx],
                     }
 
+    def randomized_digest(self, key_id, randomizer_R, message):
+        return self.h_tag(
+            b"threshold-ots-digest",
+            key_id.to_bytes(4, "big"),
+            randomizer_R,
+            message,
+        )
+
+    def randomized_digest_bits(self, key_id, randomizer_R, message):
+        return self.bytes_to_bits(self.randomized_digest(key_id, randomizer_R, message))
+
+    def verify_randomized_lamport_signature(self, key_id, randomizer_R, message, revealed, pk):
+        digest_bits = self.randomized_digest_bits(key_id, randomizer_R, message)
+
+        if len(revealed) != self.lamport_bits:
+            return False
+
+        for i, bit in enumerate(digest_bits):
+            if self.H(revealed[i]) != pk.pub[bit][i]:
+                return False
+
+        return True
+
     def normalise_subset(self, active_party_ids):
         if active_party_ids is None:
             active_party_ids = list(range(self.threshold_k))
@@ -513,6 +536,24 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
         if party_id not in subset:
             raise PermissionError("party is not a member of the selected k-of-k subtree")
         return super().party_produce_share(party_id, leaf_index, message,)
+
+    def party_produce_randomized_share(self, party_id, leaf_index, message, randomizer_R):
+        subset = self.leaf_to_subset[leaf_index]
+        if party_id not in subset:
+            raise PermissionError("party is not a member of the selected k-of-k subtree")
+        if not self.approve(party_id, message):
+            raise PermissionError("party " + str(party_id) + " refused to sign")
+
+        bits = self.randomized_digest_bits(leaf_index, randomizer_R, message)
+        selected_shares = []
+        for bit_index, bit in enumerate(bits):
+            selected_shares.append(self.party_shares[party_id][leaf_index][bit_index][bit])
+
+        return ShareResponse(
+            party_id=party_id,
+            leaf_index=leaf_index,
+            selected_shares=selected_shares,
+        )
     
     def sign(self, message, leaf_index=None, active_party_ids=None):
         subset = self.normalise_subset(active_party_ids)
@@ -527,20 +568,58 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
         if leaf_index in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
 
+        randomizer_R = self.randbytes(self.digest_size)
         share_responses = []
         for pid in subset:
-            resp = self.party_produce_share(pid, leaf_index, message)
+            resp = self.party_produce_randomized_share(pid, leaf_index, message, randomizer_R)
             share_responses.append(resp)
-            
+
+        digest_bits = self.randomized_digest_bits(leaf_index, randomizer_R, message)
         reconstructed_revealed = []
 
-        for bit_index in range(len(share_responses[0].selected_shares)):
+        for bit_index in range(len(digest_bits)):
             position_shares = [resp.selected_shares[bit_index] for resp in share_responses]
             reconstructed_revealed.append(self.xor_recombine(position_shares))
 
         self.used_leaves.add(leaf_index)
 
-        return ThresholdSignature(leaf_index=leaf_index, message=message, revealed=reconstructed_revealed, lamport_public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+        return ThresholdSignature(
+            key_id=leaf_index,
+            message=message,
+            randomizer_R=randomizer_R,
+            revealed=reconstructed_revealed,
+            lamport_public_key=self.leaf_public_keys[leaf_index],
+            auth_path=self.get_auth_path(leaf_index),
+            signer_ids=subset,
+        )
+
+    def verify(self, signature, message=None, public_bundle=None):
+        message = signature.message if message is None else message
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+
+        if signature.randomizer_R:
+            lamport_ok = self.verify_randomized_lamport_signature(
+                signature.key_id,
+                signature.randomizer_R,
+                message,
+                signature.revealed,
+                signature.lamport_public_key,
+            )
+        else:
+            lamport_ok = self.verify_lamport_signature(
+                message,
+                signature.revealed,
+                signature.lamport_public_key,
+            )
+
+        if not lamport_ok:
+            return False
+
+        return self.verify_merkle_path(
+            signature.lamport_public_key.leaf_hash(self),
+            signature.auth_path,
+            public_bundle.merkle_root,
+        )
     
     def benchmark(self, rounds):
         setup_times = []
@@ -643,6 +722,29 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
                     dealer_part = self.xor_bytes([secret_value] + party_parts)
                     self.dealer_correction_shares[leaf_index][bit_index][bit_value] = dealer_part
 
+    def distributed_digest(self, key_id, randomizer_R, message):
+        return self.h_tag(
+            b"distributed-ots-digest",
+            key_id.to_bytes(4, "big"),
+            randomizer_R,
+            message,
+        )
+
+    def distributed_digest_bits(self, key_id, randomizer_R, message):
+        return self.bytes_to_bits(self.distributed_digest(key_id, randomizer_R, message))
+
+    def verify_distributed_lamport_signature(self, key_id, randomizer_R, message, revealed, pk):
+        digest_bits = self.distributed_digest_bits(key_id, randomizer_R, message)
+
+        if len(revealed) != self.lamport_bits:
+            return False
+
+        for i, bit in enumerate(digest_bits):
+            if self.H(revealed[i]) != pk.pub[bit][i]:
+                return False
+
+        return True
+
     def lookup_helper_strings(self, leaf_index, signer_ids):
         subset = self.leaf_to_subset[leaf_index]
         lookup = {}
@@ -732,17 +834,11 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if recomputed_sid != session.session_id:
             raise RuntimeError("session id mismatch during round 2")
 
-        bits = self.bytes_to_bits(self.H(session.message))
+        bits = self.distributed_digest_bits(session.key_id, randomizer_R, session.message)
         selected_shares = []
         for bit_index, bit in enumerate(bits):
             share = self.prf_share(party_id, session.key_id, bit_index, bit)
-            masked_share = self.h_tag(
-                b"round2-sig-share",
-                randomizer_R,
-                share,
-                bit_index.to_bytes(4, "big"),
-            )
-            selected_shares.append(masked_share)
+            selected_shares.append(share)
 
         return Round2Response(
             party_id=party_id,
@@ -760,11 +856,26 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if len(round2_responses) != len(session.signer_ids):
             raise ValueError("missing round2 responses")
 
-        bits = self.bytes_to_bits(self.H(session.message))
+        ordered_responses = sorted(round2_responses, key=lambda resp: resp.party_id)
+        expected_path = self.get_auth_path(key_id)
+        expected_parties = sorted(session.signer_ids)
+        response_parties = [resp.party_id for resp in ordered_responses]
+        if response_parties != expected_parties:
+            raise ValueError("round2 signer set mismatch")
+
+        for resp in ordered_responses:
+            if resp.key_id != key_id:
+                raise ValueError("round2 response key_id mismatch")
+            if len(resp.selected_shares) != self.lamport_bits:
+                raise ValueError("invalid round2 share count")
+            if resp.auth_path.siblings != expected_path.siblings or resp.auth_path.directions != expected_path.directions:
+                raise ValueError("round2 auth path mismatch")
+
+        bits = self.distributed_digest_bits(key_id, randomizer_R, session.message)
         revealed = []
         for bit_index, bit in enumerate(bits):
             dealer_part = self.dealer_correction_shares[key_id][bit_index][bit]
-            party_parts = [self.prf_share(pid, key_id, bit_index, bit) for pid in session.signer_ids]
+            party_parts = [resp.selected_shares[bit_index] for resp in ordered_responses]
             revealed.append(self.xor_bytes([dealer_part] + party_parts))
 
         self.used_leaves.add(key_id)
@@ -806,6 +917,26 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         session = self.create_signing_session(message=message, signer_ids=signer_ids, leaf_index=leaf_index,)
 
         return self.sign_with_session(session)
+
+    def verify(self, signature, message=None, public_bundle=None):
+        message = signature.message if message is None else message
+        public_bundle = self.public_bundle if public_bundle is None else public_bundle
+        lamport_ok = self.verify_distributed_lamport_signature(
+            signature.key_id,
+            signature.randomizer_R,
+            message,
+            signature.revealed,
+            signature.lamport_public_key,
+        )
+
+        if not lamport_ok:
+            return False
+
+        return self.verify_merkle_path(
+            signature.lamport_public_key.leaf_hash(self),
+            signature.auth_path,
+            public_bundle.merkle_root,
+        )
     
     def benchmark(self, rounds):
         setup_times = []
@@ -1051,7 +1182,17 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
     def verify(self, signature, message=None, public_bundle=None):
         message = signature.message if message is None else message
         public_bundle = self.public_bundle if public_bundle is None else public_bundle
-        if not self.verify_lamport_signature(message, signature.revealed, signature.lamport_public_key):
+        if signature.randomizer_R:
+            ots_ok = self.verify_randomized_lamport_signature(
+                signature.key_id,
+                signature.randomizer_R,
+                message,
+                signature.revealed,
+                signature.lamport_public_key,
+            )
+        else:
+            ots_ok = self.verify_lamport_signature(message, signature.revealed, signature.lamport_public_key)
+        if not ots_ok:
             return False
         leaf_hash = signature.lamport_public_key.leaf_hash(self)
         if isinstance(signature.auth_path, HierarchicalMerklePath):
@@ -1137,18 +1278,28 @@ class WinternitzPublicKey:
         return scheme.h_tag(b"winternitz-leaf", *self.pub)
     
 class WinternitzThresholdSignature:
-    def __init__(self, leaf_index, message, revealed, public_key, auth_path):
-        self.leaf_index = leaf_index
+    def __init__(self, leaf_index=None, message=None, revealed=None, public_key=None, auth_path=None, key_id=None, randomizer_R=None, signer_ids=None):
+        if key_id is None:
+            key_id = leaf_index
+        if key_id is None:
+            raise ValueError("key_id or leaf_index must be provided")
+        self.key_id = key_id
+        self.leaf_index = key_id
         self.message = message
         self.revealed = revealed
         self.public_key = public_key
         self.auth_path = auth_path
+        self.randomizer_R = b"" if randomizer_R is None else randomizer_R
+        self.signer_ids = [] if signer_ids is None else signer_ids
 
 class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, w=16, approval_policies=None):
         if w < 2:
             raise ValueError("w must be at least 2")
         
+        self.helper_strings = {}
+        self.party_prf_seeds = {}
+        self.dealer_chain_corrections = {}
         self.w = w
         self.log_w = self.compute_log_w(w)
 
@@ -1228,8 +1379,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
 
         return digits
     
-    def message_digits_with_checksum(self, message):
-        digest = self.H(message)
+    def winternitz_message_digits_from_digest(self, digest):
         msg_digits = self.bytes_to_base_w(digest, self.len1)
 
         checksum = 0
@@ -1238,6 +1388,14 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
 
         checksum_digits = self.int_to_base_w(checksum, self.len2)
         return msg_digits + checksum_digits
+
+    def message_digits_with_checksum(self, message):
+        digest = self.H(message)
+        return self.winternitz_message_digits_from_digest(digest)
+
+    def randomized_message_digits_with_checksum(self, key_id, randomizer_R, message):
+        digest = self.randomized_digest(key_id, randomizer_R, message)
+        return self.winternitz_message_digits_from_digest(digest)
     
     def generate_winternitz_keypair(self):
         sk = []
@@ -1256,7 +1414,6 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             raise ValueError("tree_height is too small for all k-of-k subtrees")
         self.leaf_secret_keys = []
         self.leaf_public_keys = []
-        self.party_shares = {pid: {} for pid in range(self.parties)}
         self.used_leaves = set()
 
         for _ in range(self.num_leaves):
@@ -1270,25 +1427,42 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
 
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
         self.assign_leaves_to_subsets()
-        self.build_winternitz_threshold_shares()
+        self.build_helper_strings()
+        self.build_winternitz_prf_corrections()
 
         self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
 
-    def build_winternitz_threshold_shares(self):
+    def build_helper_strings(self):
+        self.helper_strings = {}
+        self.party_prf_seeds = {pid: self.randbytes(32) for pid in range(self.parties)}
+
+        for pid in range(self.parties):
+            self.helper_strings[pid] = {}
+            for leaf_index in range(self.num_leaves):
+                self.helper_strings[pid][leaf_index] = self.randbytes(16)
+
+    def winternitz_prf_share(self, party_id, leaf_index, chain_index):
+        seed = self.party_prf_seeds[party_id]
+        helper = self.helper_strings[party_id][leaf_index]
+        return self.h_tag(
+            b"winternitz-party-prf-share",
+            seed,
+            helper,
+            leaf_index.to_bytes(4, "big"),
+            chain_index.to_bytes(4, "big"),
+        )
+
+    def build_winternitz_prf_corrections(self):
+        self.dealer_chain_corrections = {}
         for leaf_index, winternitz_sk in enumerate(self.leaf_secret_keys):
             subset = self.leaf_to_subset[leaf_index]
-
-            for pid in range(self.parties):
-                self.party_shares[pid][leaf_index] = {}
+            self.dealer_chain_corrections[leaf_index] = {}
 
             for chain_index in range(self.num_chains):
-                shares = self.xor_share(
-                    winternitz_sk[chain_index],
-                    len(subset),
-                )
-
-                for local_idx, pid in enumerate(subset):
-                    self.party_shares[pid][leaf_index][chain_index] = shares[local_idx]
+                secret_value = winternitz_sk[chain_index]
+                party_parts = [self.winternitz_prf_share(pid, leaf_index, chain_index) for pid in subset]
+                dealer_part = self.xor_bytes([secret_value] + party_parts)
+                self.dealer_chain_corrections[leaf_index][chain_index] = dealer_part
 
     def party_produce_share(self, party_id, leaf_index, message):
         subset = self.leaf_to_subset[leaf_index]
@@ -1300,7 +1474,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         selected = []
 
         for chain_index in range(self.num_chains):
-            selected.append(self.party_shares[party_id][leaf_index][chain_index])
+            selected.append(self.winternitz_prf_share(party_id, leaf_index, chain_index))
         
         return ShareResponse(party_id, leaf_index, selected,)
     
@@ -1323,24 +1497,35 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         for pid in subset:
             resp = self.party_produce_share(pid, leaf_index, message)
             share_responses.append(resp)
-            
-        digits = self.message_digits_with_checksum(message)
+
+        randomizer_R = self.randbytes(self.digest_size)
+        digits = self.randomized_message_digits_with_checksum(leaf_index, randomizer_R, message)
         revealed = []
 
         for chain_index in range(self.num_chains):
-            secret_element = self.xor_recombine([resp.selected_shares[chain_index] for resp in share_responses])
+            dealer_part = self.dealer_chain_corrections[leaf_index][chain_index]
+            party_parts = [resp.selected_shares[chain_index] for resp in share_responses]
+            secret_element = self.xor_recombine([dealer_part] + party_parts)
             signature_element = self.hash_iter(secret_element, digits[chain_index])
             revealed.append(signature_element)
 
         self.used_leaves.add(leaf_index)
 
-        return WinternitzThresholdSignature(leaf_index=leaf_index, message=message, revealed=revealed, public_key=self.leaf_public_keys[leaf_index], auth_path=self.get_auth_path(leaf_index),)
+        return WinternitzThresholdSignature(
+            key_id=leaf_index,
+            message=message,
+            randomizer_R=randomizer_R,
+            revealed=revealed,
+            public_key=self.leaf_public_keys[leaf_index],
+            auth_path=self.get_auth_path(leaf_index),
+            signer_ids=subset,
+        )
     
-    def verify_winternitz_signature(self, message, revealed, public_key):
+    def verify_winternitz_signature(self, key_id, randomizer_R, message, revealed, public_key):
         if len(revealed) != self.num_chains:
             return False
-        
-        digits = self.message_digits_with_checksum(message)
+
+        digits = self.randomized_message_digits_with_checksum(key_id, randomizer_R, message)
 
         for i in range(self.num_chains):
             if self.hash_iter(revealed[i], self.w - 1 - digits[i]) != public_key.pub[i]:
@@ -1351,7 +1536,13 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
     def verify(self, signature, message=None, public_bundle=None):
         message = signature.message if message is None else message
         public_bundle = self.public_bundle if public_bundle is None else public_bundle
-        ots_ok = self.verify_winternitz_signature(message, signature.revealed, signature.public_key,)
+        ots_ok = self.verify_winternitz_signature(
+            signature.key_id,
+            signature.randomizer_R,
+            message,
+            signature.revealed,
+            signature.public_key,
+        )
 
         if not ots_ok:
             return False

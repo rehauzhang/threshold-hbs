@@ -12,11 +12,11 @@
 
 ## Extensions
 - This project includes five extensions beyond the minimal scheme
-- Extension 1: k-of-n Threshold Signing: implements a k-of-n threshold scheme using a k-of-k subset-based (subtree-style) construction, where only k selected parties are required to produce a valid signature.
+- Extension 1: k-of-n Threshold Signing: implements a k-of-n threshold scheme using a k-of-k subset-based (subtree-style) construction, where only k selected parties are required to produce a valid signature, and each signature binds a KeyID and randomizer R to the message.
 - Extension 2: Distributed Threshold Signing: partially removes the fully trusted dealer assumption by introducing helper string lookup, allowing parties to locally derive shares using a hash-based PRF-like method, keeping only a correction share at the dealer, and running an explicit two-round peer-to-peer signing protocol.
 - Extension 3: Batched Signing: supports batch signing by buffering multiple messages into a Merkle tree, signing only the batch root, verifying individual messages using authentication paths.
 - Extension 4: Hierarchical Batched Signing: introduces a hierarchical Merkle structure: leaves remain Lamport nodes, upper layers are organised into subtree + upper tree, authentication paths become hierarchical.
-- Extension 5: Winternitz Optimization: replaces Lamport signatures with Winternitz signatures to reduce signature size, improve efficiency, while preserving the threshold structure. 
+- Extension 5: Winternitz Optimization: replaces Lamport signatures with Winternitz signatures to reduce signature size and improve efficiency, while preserving the threshold structure and the randomized KeyID-plus-R signing flow.
 
 ## Structure
 - `threshold_hbs.py`: core implementation of the scheme, including all schemes and extensions. 
