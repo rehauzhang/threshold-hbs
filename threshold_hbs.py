@@ -52,20 +52,27 @@ class Round1Response:
     def __init__(self, party_id, key_id, r_share, chk_share):
         self.party_id = party_id
         self.key_id = key_id
+        self.leaf_index = key_id
         self.r_share = r_share
         self.chk_share = chk_share
 
 class Round2Response:
-    def __init__(self, party_id, key_id, selected_shares, auth_path):
+    def __init__(self, party_id, key_id, selected_shares=None, auth_path=None, sk_shares=None, path_shares=None):
         self.party_id = party_id
         self.key_id = key_id
+        self.leaf_index = key_id
+        if selected_shares is None:
+            selected_shares = sk_shares
         self.selected_shares = selected_shares
         self.auth_path = auth_path
+        self.sk_shares = selected_shares
+        self.path_shares = [] if path_shares is None else path_shares
 
 class SigningSession:
     def __init__(self, message, key_id, signer_ids, helper_lookup, session_id):
         self.message = message
         self.key_id = key_id
+        self.leaf_index = key_id
         self.signer_ids = signer_ids
         self.helper_lookup = helper_lookup
         self.session_id = session_id
@@ -76,6 +83,13 @@ class PublicKeyBundle:
         self.max_signatures = max_signatures
         self.hash_name = hash_name
         self.leaves = leaves
+
+class CRVEntry:
+    def __init__(self, r_share, chk_shares, path_shares, sk_shares):
+        self.R = r_share
+        self.chk = chk_shares
+        self.PATH = path_shares
+        self.SK = sk_shares
 
 class BenchmarkResult:
     def __init__(self, parties, tree_height, rounds, setup_avg, sign_avg, verify_avg):
@@ -657,22 +671,22 @@ class KOfNThresholdHBSScheme(ThresholdHBSScheme):
             "verify_time": round(statistics.mean(verify_times), 8),
         }
     
-# Extension 2: 
+# Extension 2:
 # the untrusted server only looks up helper strings
 # each party derives its own share locally using a hash-based PRF-like method
-# the dealer keeps only one correction share
+# the dealer exposes CRV-style correction values for R, CHK, PATH, and SK
 class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, approval_policies=None):
         self.helper_strings = {}
         self.party_prf_seeds = {}
-        self.dealer_correction_shares = {}
+        self.crv = {}
         super().__init__(parties, threshold_k, tree_height, approval_policies)
 
     def dealer_setup(self):
         subset_count = len(self.subset_parties)
         if self.num_leaves < subset_count:
             raise ValueError("tree_height is too small for all k-of-k subtrees")
-        
+
         self.leaf_secret_keys = []
         self.leaf_public_keys = []
         self.party_shares = {pid: {} for pid in range(self.parties)}
@@ -690,9 +704,14 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
         self.assign_leaves_to_subsets()
         self.build_helper_strings()
-        self.build_prf_based_shares()
+        self.build_crv_entries()
 
-        self.public_bundle = PublicKeyBundle(merkle_root=self.get_merkle_root(), max_signatures=self.num_leaves, hash_name=self.hash_name, leaves=self.num_leaves,)
+        self.public_bundle = PublicKeyBundle(
+            merkle_root=self.get_merkle_root(),
+            max_signatures=self.num_leaves,
+            hash_name=self.hash_name,
+            leaves=self.num_leaves,
+        )
 
     def build_helper_strings(self):
         self.helper_strings = {}
@@ -703,24 +722,109 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             for leaf_index in range(self.num_leaves):
                 self.helper_strings[pid][leaf_index] = self.randbytes(16)
 
-    def prf_share(self, party_id, leaf_index, bit_index, bit_value):
+    def prf_expand(self, label, seed, *parts, out_len=None):
+        if out_len is None:
+            out_len = self.digest_size
+
+        output = b""
+        counter = 0
+        while len(output) < out_len:
+            output += self.h_tag(label, seed, *parts, counter.to_bytes(4, "big"))
+            counter += 1
+        return output[:out_len]
+
+    def prf_r_share(self, party_id, leaf_index):
         seed = self.party_prf_seeds[party_id]
         helper = self.helper_strings[party_id][leaf_index]
+        return self.prf_expand(
+            b"PRFR",
+            seed,
+            helper,
+            leaf_index.to_bytes(4, "big"),
+            out_len=self.digest_size,
+        )
 
-        return self.h_tag(b"party-prf-share", seed, helper, leaf_index.to_bytes(4, "big"), bit_index.to_bytes(4, "big"), bit_value.to_bytes(1, "big"),)
-    
-    def build_prf_based_shares(self):
-        self.dealer_correction_shares = {}
+    def prf_chk_mask(self, party_id, leaf_index):
+        seed = self.party_prf_seeds[party_id]
+        helper = self.helper_strings[party_id][leaf_index]
+        return self.prf_expand(
+            b"PRFChk",
+            seed,
+            helper,
+            leaf_index.to_bytes(4, "big"),
+            out_len=self.digest_size,
+        )
+
+    def prf_auth_value(self, party_id, leaf_index, randomizer_R):
+        seed = self.party_prf_seeds[party_id]
+        return self.prf_expand(
+            b"PRFAuth",
+            seed,
+            leaf_index.to_bytes(4, "big"),
+            randomizer_R,
+            out_len=self.digest_size,
+        )
+
+    def prf_path_share(self, party_id, leaf_index, level_index):
+        seed = self.party_prf_seeds[party_id]
+        helper = self.helper_strings[party_id][leaf_index]
+        return self.prf_expand(
+            b"PRFPATH",
+            seed,
+            helper,
+            leaf_index.to_bytes(4, "big"),
+            level_index.to_bytes(4, "big"),
+            out_len=self.digest_size,
+        )
+
+    def prf_sk_share(self, party_id, leaf_index, bit_index, bit_value):
+        seed = self.party_prf_seeds[party_id]
+        helper = self.helper_strings[party_id][leaf_index]
+        return self.prf_expand(
+            b"PRFChain",
+            seed,
+            helper,
+            leaf_index.to_bytes(4, "big"),
+            bit_index.to_bytes(4, "big"),
+            bit_value.to_bytes(1, "big"),
+            out_len=self.digest_size,
+        )
+
+    def build_crv_entries(self):
+        self.crv = {}
         for leaf_index, lamport_sk in enumerate(self.leaf_secret_keys):
             subset = self.leaf_to_subset[leaf_index]
-            self.dealer_correction_shares[leaf_index] = {}
+            path = self.get_auth_path(leaf_index)
+            randomizer_R = self.randbytes(self.digest_size)
+
+            r_parts = [self.prf_r_share(pid, leaf_index) for pid in subset]
+            crv_r = self.xor_bytes([randomizer_R] + r_parts)
+
+            chk_shares = {}
+            for pid in subset:
+                auth_value = self.prf_auth_value(pid, leaf_index, randomizer_R)
+                chk_mask = self.prf_chk_mask(pid, leaf_index)
+                chk_shares[pid] = self.xor_bytes([auth_value, chk_mask])
+
+            path_shares = []
+            for level_index, sibling in enumerate(path.siblings):
+                parts = [self.prf_path_share(pid, leaf_index, level_index) for pid in subset]
+                path_shares.append(self.xor_bytes([sibling] + parts))
+
+            sk_shares = {}
             for bit_index in range(self.lamport_bits):
-                self.dealer_correction_shares[leaf_index][bit_index] = {}
+                sk_shares[bit_index] = {}
                 for bit_value in (0, 1):
                     secret_value = lamport_sk[bit_value][bit_index]
-                    party_parts = [self.prf_share(pid, leaf_index, bit_index, bit_value) for pid in subset]
-                    dealer_part = self.xor_bytes([secret_value] + party_parts)
-                    self.dealer_correction_shares[leaf_index][bit_index][bit_value] = dealer_part
+                    parts = [self.prf_sk_share(pid, leaf_index, bit_index, bit_value) for pid in subset]
+                    sk_shares[bit_index][bit_value] = self.xor_bytes([secret_value] + parts)
+
+            self.crv[leaf_index] = CRVEntry(
+                r_share=crv_r,
+                chk_shares=chk_shares,
+                path_shares=path_shares,
+                sk_shares=sk_shares,
+            )
 
     def distributed_digest(self, key_id, randomizer_R, message):
         return self.h_tag(
@@ -735,14 +839,11 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
     def verify_distributed_lamport_signature(self, key_id, randomizer_R, message, revealed, pk):
         digest_bits = self.distributed_digest_bits(key_id, randomizer_R, message)
-
         if len(revealed) != self.lamport_bits:
             return False
-
         for i, bit in enumerate(digest_bits):
             if self.H(revealed[i]) != pk.pub[bit][i]:
                 return False
-
         return True
 
     def lookup_helper_strings(self, leaf_index, signer_ids):
@@ -753,23 +854,21 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
                 raise PermissionError("party is not part of the selected subtree")
             lookup[pid] = self.helper_strings[pid][leaf_index]
         return lookup
-    
+
     def build_session_id(self, message, leaf_index, signer_ids, helper_lookup):
         parts = [message, leaf_index.to_bytes(4, "big")]
         for pid in sorted(signer_ids):
             parts.append(pid.to_bytes(2, "big"))
             parts.append(helper_lookup[pid])
         return self.h_tag(b"distributed-session", *parts)
-    
+
     def party_agree_session(self, party_id, message, leaf_index, signer_ids, helper_lookup):
         if party_id not in signer_ids:
             raise PermissionError("party not selected for this signing session")
-        
         if not self.approve(party_id, message):
             raise PermissionError("party " + str(party_id) + " refused to sign")
-        
         return self.build_session_id(message, leaf_index, signer_ids, helper_lookup)
-    
+
     def create_signing_session(self, message, signer_ids, leaf_index=None):
         subset = self.normalise_subset(signer_ids)
         if leaf_index is None:
@@ -778,14 +877,12 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if leaf_index is None:
             raise RuntimeError("all leaves for the selected k-of-k subtree are exhausted")
 
-        # In this prototype, KeyID is implemented as the Lamport leaf index.
         helper_lookup = self.lookup_helper_strings(leaf_index, subset)
-
         session_ids = [self.party_agree_session(pid, message, leaf_index, subset, helper_lookup) for pid in subset]
-        
+
         if len(set(session_ids)) != 1:
             raise RuntimeError("parties did not agree on the same session id")
-            
+
         return SigningSession(
             message=message,
             key_id=leaf_index,
@@ -793,34 +890,59 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             helper_lookup=helper_lookup,
             session_id=session_ids[0],
         )
-    
-    def run_round1(self, session):
-        responses = []
-        for pid in session.signer_ids:
-            responses.append(
-                self.party_round1_response(
-                    party_id=pid,
-                    key_id=session.key_id,
-                    message=session.message,
-                    signer_ids=session.signer_ids,
-                    helper_lookup=session.helper_lookup,
-                )
-            )
 
-        randomizer_R, combined_chk = self.combine_round1_responses(
-            responses,
-            message=session.message,
-            key_id=session.key_id,
-            signer_ids=session.signer_ids,
+    def party_round1_response(self, party_id, session):
+        key_id = session.key_id
+        if party_id not in session.signer_ids:
+            raise PermissionError("party not selected for this signing session")
+        if not self.approve(party_id, session.message):
+            raise PermissionError("party " + str(party_id) + " refused to sign")
+
+        return Round1Response(
+            party_id=party_id,
+            key_id=key_id,
+            r_share=self.prf_r_share(party_id, key_id),
+            chk_share=self.crv[key_id].chk[party_id],
         )
 
+    def combine_round1_responses(self, session, round1_responses):
+        key_id = session.key_id
+        if len(round1_responses) != len(session.signer_ids):
+            raise ValueError("missing round1 responses")
+
+        ordered_responses = sorted(round1_responses, key=lambda resp: resp.party_id)
+        expected_parties = sorted(session.signer_ids)
+        response_parties = [resp.party_id for resp in ordered_responses]
+        if response_parties != expected_parties:
+            raise ValueError("round1 signer set mismatch")
+
+        crv_entry = self.crv[key_id]
+        randomizer_R = self.xor_bytes([crv_entry.R] + [resp.r_share for resp in ordered_responses])
+
+        chk_map = {}
+        for resp in ordered_responses:
+            if resp.key_id != key_id:
+                raise ValueError("round1 response key_id mismatch")
+            chk_value = self.xor_bytes([resp.chk_share, self.prf_chk_mask(resp.party_id, key_id)])
+            expected_chk = self.prf_auth_value(resp.party_id, key_id, randomizer_R)
+            if chk_value != expected_chk:
+                raise RuntimeError("round1 CHK validation failed")
+            chk_map[resp.party_id] = chk_value
+
+        return randomizer_R, chk_map
+
+    def run_round1(self, session):
+        responses = [self.party_round1_response(pid, session) for pid in session.signer_ids]
+        randomizer_R, chk_map = self.combine_round1_responses(session, responses)
+        session.randomizer_R = randomizer_R
+        session.chk_map = chk_map
         return {
             "responses": responses,
             "R": randomizer_R,
-            "chk": combined_chk,
+            "chk_map": chk_map,
         }
-    
-    def party_round2_response(self, party_id, session, randomizer_R):
+
+    def party_round2_response(self, party_id, session, randomizer_R, chk_value=None):
         if party_id not in session.signer_ids:
             raise PermissionError("party not selected for this signing session")
 
@@ -834,49 +956,74 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if recomputed_sid != session.session_id:
             raise RuntimeError("session id mismatch during round 2")
 
+        if chk_value is None:
+            if not hasattr(session, "chk_map") or party_id not in session.chk_map:
+                raise RuntimeError("missing round1 CHK value for round 2")
+            chk_value = session.chk_map[party_id]
+
+        expected_chk = self.prf_auth_value(party_id, session.key_id, randomizer_R)
+        if chk_value != expected_chk:
+            raise RuntimeError("round2 CHK validation failed")
+
         bits = self.distributed_digest_bits(session.key_id, randomizer_R, session.message)
-        selected_shares = []
+        sk_shares = []
         for bit_index, bit in enumerate(bits):
-            share = self.prf_share(party_id, session.key_id, bit_index, bit)
-            selected_shares.append(share)
+            sk_shares.append(self.prf_sk_share(party_id, session.key_id, bit_index, bit))
+
+        path_proto = self.get_auth_path(session.key_id)
+        path_shares = []
+        for level_index in range(len(path_proto.siblings)):
+            path_shares.append(self.prf_path_share(party_id, session.key_id, level_index))
 
         return Round2Response(
             party_id=party_id,
             key_id=session.key_id,
-            selected_shares=selected_shares,
-            auth_path=self.get_auth_path(session.key_id),
+            selected_shares=sk_shares,
+            auth_path=path_proto,
+            path_shares=path_shares,
         )
-    
+
     def assemble_signature(self, session, randomizer_R, round2_responses):
         key_id = session.key_id
-
         if key_id in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
-
         if len(round2_responses) != len(session.signer_ids):
             raise ValueError("missing round2 responses")
 
         ordered_responses = sorted(round2_responses, key=lambda resp: resp.party_id)
-        expected_path = self.get_auth_path(key_id)
         expected_parties = sorted(session.signer_ids)
         response_parties = [resp.party_id for resp in ordered_responses]
         if response_parties != expected_parties:
             raise ValueError("round2 signer set mismatch")
 
-        for resp in ordered_responses:
-            if resp.key_id != key_id:
-                raise ValueError("round2 response key_id mismatch")
-            if len(resp.selected_shares) != self.lamport_bits:
-                raise ValueError("invalid round2 share count")
-            if resp.auth_path.siblings != expected_path.siblings or resp.auth_path.directions != expected_path.directions:
-                raise ValueError("round2 auth path mismatch")
-
+        crv_entry = self.crv[key_id]
         bits = self.distributed_digest_bits(key_id, randomizer_R, session.message)
+
         revealed = []
         for bit_index, bit in enumerate(bits):
-            dealer_part = self.dealer_correction_shares[key_id][bit_index][bit]
-            party_parts = [resp.selected_shares[bit_index] for resp in ordered_responses]
-            revealed.append(self.xor_bytes([dealer_part] + party_parts))
+            parts = [crv_entry.SK[bit_index][bit]]
+            for resp in ordered_responses:
+                if resp.key_id != key_id:
+                    raise ValueError("round2 response key_id mismatch")
+                if len(resp.sk_shares) != self.lamport_bits:
+                    raise ValueError("invalid round2 share count")
+                parts.append(resp.sk_shares[bit_index])
+            revealed.append(self.xor_bytes(parts))
+
+        path_proto = self.get_auth_path(key_id)
+        reconstructed_siblings = []
+        for level_index in range(len(path_proto.siblings)):
+            parts = [crv_entry.PATH[level_index]]
+            for resp in ordered_responses:
+                if len(resp.path_shares) != len(path_proto.siblings):
+                    raise ValueError("invalid round2 path share count")
+                parts.append(resp.path_shares[level_index])
+            reconstructed_siblings.append(self.xor_bytes(parts))
+
+        reconstructed_path = MerklePath(
+            siblings=reconstructed_siblings,
+            directions=path_proto.directions,
+        )
 
         self.used_leaves.add(key_id)
 
@@ -886,7 +1033,7 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             randomizer_R=randomizer_R,
             revealed=revealed,
             lamport_public_key=self.leaf_public_keys[key_id],
-            auth_path=self.get_auth_path(key_id),
+            auth_path=reconstructed_path,
             signer_ids=session.signer_ids,
         )
 
@@ -899,7 +1046,7 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
         if key_id in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
-        
+
         for pid in signer_ids:
             recomputed_sid = self.party_agree_session(pid, message, key_id, signer_ids, helper_lookup)
             if recomputed_sid != session_id:
@@ -909,13 +1056,18 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         randomizer_R = round1["R"]
         round2_responses = []
         for pid in signer_ids:
-            round2_responses.append(self.party_round2_response(pid, session, randomizer_R))
+            round2_responses.append(
+                self.party_round2_response(pid, session, randomizer_R, round1["chk_map"][pid])
+            )
 
         return self.assemble_signature(session, randomizer_R, round2_responses)
-    
-    def sign(self, message, leaf_index=None, signer_ids=None):
-        session = self.create_signing_session(message=message, signer_ids=signer_ids, leaf_index=leaf_index,)
 
+    def sign(self, message, leaf_index=None, signer_ids=None):
+        session = self.create_signing_session(
+            message=message,
+            signer_ids=signer_ids,
+            leaf_index=leaf_index,
+        )
         return self.sign_with_session(session)
 
     def verify(self, signature, message=None, public_bundle=None):
@@ -937,7 +1089,7 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
             signature.auth_path,
             public_bundle.merkle_root,
         )
-    
+
     def benchmark(self, rounds):
         setup_times = []
         sign_times = []
@@ -959,63 +1111,20 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
             if not ok:
                 raise RuntimeError("benchmark produced invalid signature")
-            
+
             setup_times.append(t1 - t0)
             sign_times.append(t2 - t1)
             verify_times.append(t3 - t2)
 
         return {
-            "parties":self.parties, 
-            "threshold_k": self.threshold_k, 
-            "tree_height": self.tree_height, 
-            "rounds":rounds, 
+            "parties": self.parties,
+            "threshold_k": self.threshold_k,
+            "tree_height": self.tree_height,
+            "rounds": rounds,
             "setup_time": round(statistics.mean(setup_times), 8),
             "sign_time": round(statistics.mean(sign_times), 8),
             "verify_time": round(statistics.mean(verify_times), 8),
         }
-    def party_round1_response(self, party_id, key_id, message, signer_ids, helper_lookup):
-        if party_id not in signer_ids:
-            raise PermissionError("party not selected for this signing session")
-
-        if not self.approve(party_id, message):
-            raise PermissionError("party " + str(party_id) + " refused to sign")
-
-        helper = helper_lookup[party_id]
-        r_share = self.h_tag(
-            b"round1-r-share",
-            self.party_prf_seeds[party_id],
-            helper,
-            key_id.to_bytes(4, "big"),
-            message,
-        )
-        chk_share = self.h_tag(
-            b"round1-chk-share",
-            r_share,
-            party_id.to_bytes(2, "big"),
-            key_id.to_bytes(4, "big"),
-        )
-        return Round1Response(party_id, key_id, r_share, chk_share)
-    
-    def combine_round1_responses(self, round1_responses, message, key_id, signer_ids):
-        if len(round1_responses) != len(signer_ids):
-            raise ValueError("missing round1 responses")
-
-        ordered = sorted(round1_responses, key=lambda resp: resp.party_id)
-        r_parts = [resp.r_share for resp in ordered]
-        chk_parts = [resp.chk_share for resp in ordered]
-
-        randomizer_R = self.h_tag(
-            b"round1-randomizer",
-            message,
-            key_id.to_bytes(4, "big"),
-            *r_parts,
-        )
-        combined_chk = self.h_tag(
-            b"round1-check",
-            randomizer_R,
-            *chk_parts,
-        )
-        return randomizer_R, combined_chk
 
 
 
