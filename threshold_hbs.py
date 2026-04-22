@@ -1362,7 +1362,7 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
         }
     
 # Extension 5:
-# add support for Winternitz while keeping the threshold subtree structure
+# add support for Winternitz while reusing the distributed two-round signing flow
 class WinternitzPublicKey:
     def __init__(self, pub):
         self.pub = pub
@@ -1392,21 +1392,16 @@ class WinternitzThresholdSignature:
         self.leaf_index = key_id
         self.message = message
         self.randomizer = b"" if randomizer is None else randomizer
-        
         self.revealed = revealed
         self.public_key = public_key
         self.auth_path = auth_path
         self.signer_ids = [] if signer_ids is None else list(signer_ids)
 
 
-class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
+class WinternitzThresholdHBSScheme(DistributedThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, w=16, approval_policies=None):
         if w < 2:
             raise ValueError("w must be at least 2")
-
-        self.helper_strings = {}
-        self.party_prf_seeds = {}
-        self.dealer_chain_corrections = {}
 
         self.w = w
         self.log_w = self.compute_log_w(w)
@@ -1497,8 +1492,8 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         checksum_digits = self.int_to_base_w(checksum, self.len2)
         return msg_digits + checksum_digits
 
-    def randomized_message_digits_with_checksum(self, key_id, randomizer, message):
-        digest = self.randomized_message_digest(key_id, randomizer, message)
+    def randomized_message_digits_with_checksum(self, leaf_index, randomizer, message):
+        digest = self.randomized_message_digest(leaf_index, randomizer, message)
         return self.winternitz_message_digits_from_digest(digest)
 
     def generate_winternitz_keypair(self):
@@ -1533,7 +1528,7 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         self.merkle_levels = self.build_merkle_tree(leaf_hashes)
         self.assign_leaves_to_subsets()
         self.build_helper_strings()
-        self.build_winternitz_prf_corrections()
+        self.build_crv_entries()
 
         self.public_bundle = PublicKeyBundle(
             merkle_root=self.get_merkle_root(),
@@ -1542,83 +1537,141 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             leaves=self.num_leaves,
         )
 
-    def build_helper_strings(self):
-        self.helper_strings = {}
-        self.party_prf_seeds = {pid: self.randbytes(32) for pid in range(self.parties)}
-
-        for pid in range(self.parties):
-            self.helper_strings[pid] = {}
-            for leaf_index in range(self.num_leaves):
-                self.helper_strings[pid][leaf_index] = self.randbytes(16)
-
     def winternitz_prf_share(self, party_id, leaf_index, chain_index):
         seed = self.party_prf_seeds[party_id]
         helper = self.helper_strings[party_id][leaf_index]
-        return self.h_tag(
-            b"winternitz-party-prf-share",
+        return self.prf_expand(
+            b"PRFWOTS",
             seed,
             helper,
             leaf_index.to_bytes(4, "big"),
             chain_index.to_bytes(4, "big"),
+            out_len=self.digest_size,
         )
 
-    def build_winternitz_prf_corrections(self):
-        self.dealer_chain_corrections = {}
+    def build_crv_entries(self):
+        self.crv = {}
+
         for leaf_index, winternitz_sk in enumerate(self.leaf_secret_keys):
             subset = self.leaf_to_subset[leaf_index]
-            self.dealer_chain_corrections[leaf_index] = {}
+            path = self.get_auth_path(leaf_index)
+            randomizer = self.randbytes(self.digest_size)
 
+            # CRV.R
+            r_parts = [self.prf_r_share(pid, leaf_index) for pid in subset]
+            crv_r = self.xor_bytes([randomizer] + r_parts)
+
+            # CRV.chk
+            chk_shares = {}
+            for pid in subset:
+                auth_value = self.prf_auth_value(pid, leaf_index, randomizer)
+                chk_mask = self.prf_chk_mask(pid, leaf_index)
+                chk_shares[pid] = self.xor_bytes([auth_value, chk_mask])
+
+            # CRV.PATH
+            path_shares = []
+            for level_index, sibling in enumerate(path.siblings):
+                parts = [self.prf_path_share(pid, leaf_index, level_index) for pid in subset]
+                path_shares.append(self.xor_bytes([sibling] + parts))
+
+            # CRV.SK for Winternitz chains
+            sk_shares = {}
             for chain_index in range(self.num_chains):
                 secret_value = winternitz_sk[chain_index]
-                party_parts = [
-                    self.winternitz_prf_share(pid, leaf_index, chain_index)
-                    for pid in subset
-                ]
-                dealer_part = self.xor_bytes([secret_value] + party_parts)
-                self.dealer_chain_corrections[leaf_index][chain_index] = dealer_part
+                parts = [self.winternitz_prf_share(pid, leaf_index, chain_index) for pid in subset]
+                sk_shares[chain_index] = self.xor_bytes([secret_value] + parts)
 
-    def party_produce_share(self, party_id, leaf_index, message):
-        subset = self.leaf_to_subset[leaf_index]
-        if party_id not in subset:
-            raise PermissionError("party is not a member of the selected k-of-k subtree")
-        if not self.approve(party_id, message):
-            raise PermissionError("party " + str(party_id) + " refused to sign")
+            self.crv[leaf_index] = CRVEntry(
+                r_share=crv_r,
+                chk_shares=chk_shares,
+                path_shares=path_shares,
+                sk_shares=sk_shares,
+            )
 
-        selected = []
+    def party_round2_response(self, party_id, session, randomizer, chk_value):
+        leaf_index = session["leaf_index"]
+        session_id = session["session_id"]
+
+        key = (party_id, leaf_index)
+        if key not in self.current_sessions:
+            raise RuntimeError("missing round1 session state")
+
+        state = self.current_sessions[key]
+
+        if state["session_id"] != session_id:
+            raise RuntimeError("session id mismatch in round2")
+
+        message = state["message"]
+
+        expected_auth = self.prf_auth_value(party_id, leaf_index, randomizer)
+        if expected_auth != chk_value:
+            raise PermissionError("randomizer authentication failed")
+
+        sk_shares = []
         for chain_index in range(self.num_chains):
-            selected.append(self.winternitz_prf_share(party_id, leaf_index, chain_index))
+            sk_shares.append(self.winternitz_prf_share(party_id, leaf_index, chain_index))
 
-        return ShareResponse(party_id, leaf_index, selected)
+        path_proto = self.get_auth_path(leaf_index)
+        path_shares = []
+        for level_index in range(len(path_proto.siblings)):
+            path_shares.append(self.prf_path_share(party_id, leaf_index, level_index))
 
-    def sign(self, message, leaf_index=None, active_party_ids=None):
-        subset = self.normalise_subset(active_party_ids)
-        if leaf_index is None:
-            leaf_index = self.next_unused_leaf_for_subset(subset)
+        del self.current_sessions[key]
 
-        if leaf_index is None:
-            raise RuntimeError("all Winternitz leaves are exhausted")
+        return Round2Response(
+            party_id=party_id,
+            leaf_index=leaf_index,
+            sk_shares=sk_shares,
+            path_shares=path_shares,
+        )
 
-        if self.leaf_to_subset[leaf_index] != subset:
-            raise PermissionError("leaf does not belong to the requested subtree")
+    def assemble_signature(self, session, randomizer, round2_responses):
+        message = session["message"]
+        leaf_index = session["leaf_index"]
+        signer_ids = session["signer_ids"]
 
         if leaf_index in self.used_leaves:
             raise RuntimeError("leaf already used; one-time key reuse is forbidden")
 
-        share_responses = []
-        for pid in subset:
-            resp = self.party_produce_share(pid, leaf_index, message)
-            share_responses.append(resp)
+        if len(round2_responses) != len(signer_ids):
+            raise ValueError("missing round2 responses")
 
-        randomizer = self.randbytes(self.digest_size)
+        sorted_signers = sorted(signer_ids)
+        response_parties = sorted(resp.party_id for resp in round2_responses)
+        if response_parties != sorted_signers:
+            raise ValueError("round2 signer set mismatch")
+
+        crv_entry = self.crv[leaf_index]
         digits = self.randomized_message_digits_with_checksum(leaf_index, randomizer, message)
 
         revealed = []
         for chain_index in range(self.num_chains):
-            dealer_part = self.dealer_chain_corrections[leaf_index][chain_index]
-            party_parts = [resp.selected_shares[chain_index] for resp in share_responses]
-            secret_element = self.xor_recombine([dealer_part] + party_parts)
-            signature_element = self.hash_iter(secret_element, digits[chain_index])
-            revealed.append(signature_element)
+            parts = [crv_entry.SK[chain_index]]
+            for resp in round2_responses:
+                if resp.leaf_index != leaf_index:
+                    raise ValueError("round2 response leaf index mismatch")
+                if len(resp.sk_shares) != self.num_chains:
+                    raise ValueError("invalid round2 share count")
+                parts.append(resp.sk_shares[chain_index])
+
+            secret_element = self.xor_bytes(parts)
+            revealed.append(self.hash_iter(secret_element, digits[chain_index]))
+
+        path_proto = self.get_auth_path(leaf_index)
+        reconstructed_siblings = []
+        for level_index in range(len(path_proto.siblings)):
+            parts = [crv_entry.PATH[level_index]]
+            for resp in round2_responses:
+                if len(resp.path_shares) != len(path_proto.siblings):
+                    raise ValueError("invalid round2 path share count")
+                parts.append(resp.path_shares[level_index])
+
+            reconstructed_siblings.append(self.xor_bytes(parts))
+
+        reconstructed_path = MerklePath(
+            siblings=reconstructed_siblings,
+            directions=path_proto.directions,
+        )
 
         self.used_leaves.add(leaf_index)
 
@@ -1628,15 +1681,25 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
             randomizer=randomizer,
             revealed=revealed,
             public_key=self.leaf_public_keys[leaf_index],
-            auth_path=self.get_auth_path(leaf_index),
-            signer_ids=subset,
+            auth_path=reconstructed_path,
+            signer_ids=signer_ids,
         )
 
-    def verify_winternitz_signature(self, key_id, randomizer, message, revealed, public_key):
+    def sign(self, message, leaf_index=None, active_party_ids=None, signer_ids=None):
+        if signer_ids is None:
+            signer_ids = active_party_ids
+        session = self.create_signing_session(
+            message=message,
+            signer_ids=signer_ids,
+            leaf_index=leaf_index,
+        )
+        return self.sign_with_session(session)
+
+    def verify_winternitz_signature(self, leaf_index, randomizer, message, revealed, public_key):
         if len(revealed) != self.num_chains:
             return False
 
-        digits = self.randomized_message_digits_with_checksum(key_id, randomizer, message)
+        digits = self.randomized_message_digits_with_checksum(leaf_index, randomizer, message)
 
         for i in range(self.num_chains):
             if self.hash_iter(revealed[i], self.w - 1 - digits[i]) != public_key.pub[i]:
@@ -1648,11 +1711,9 @@ class WinternitzThresholdHBSScheme(KOfNThresholdHBSScheme):
         message = signature.message if message is None else message
         public_bundle = self.public_bundle if public_bundle is None else public_bundle
 
-        randomizer = signature.randomizer
-
         ots_ok = self.verify_winternitz_signature(
             signature.leaf_index,
-            randomizer,
+            signature.randomizer,
             message,
             signature.revealed,
             signature.public_key,
