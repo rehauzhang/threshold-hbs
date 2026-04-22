@@ -632,7 +632,6 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         
         self.leaf_secret_keys = []
         self.leaf_public_keys = []
-        # self.party_shares = {pid: {} for pid in range(self.parties)}
         self.used_leaves = set()
 
         for _ in range(self.num_leaves):
@@ -1078,25 +1077,31 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
 # Extension 3: batched signing
 # use Merkle trees on buffered messages and sign the batch root once
-class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
+# built on the distributed two-round scheme
+class BatchedThresholdHBSScheme(DistributedThresholdHBSScheme):
     def batch_message_leaf(self, message):
         return self.h_tag(b"batch_message", message)
-    
+
     def build_batch_tree(self, messages):
         if not messages:
             raise ValueError("messages must be a non-empty list")
+
         leaves = [self.batch_message_leaf(m) for m in messages]
+
         n = 1
         while n < len(leaves):
             n *= 2
+
         while len(leaves) < n:
             leaves.append(self.h_tag(b"batch-pad", len(leaves).to_bytes(4, "big")))
+
         return self.build_merkle_tree(leaves)
-    
+
     def get_batch_auth_path(self, levels, leaf_index):
         idx = leaf_index
         siblings = []
         directions = []
+
         for level in levels[:-1]:
             if idx % 2 == 0:
                 sibling_index = idx + 1
@@ -1104,28 +1109,42 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
             else:
                 sibling_index = idx - 1
                 directions.append(1)
+
             siblings.append(level[sibling_index])
             idx //= 2
+
         return MerklePath(siblings, directions)
 
-    def sign_batch(self, messages, active_party_ids=None, leaf_index=None):
+    def sign_batch(self, messages, signer_ids=None, leaf_index=None):
         levels = self.build_batch_tree(messages)
         batch_root = levels[-1][0]
-        root_signature = super().sign(batch_root, leaf_index=leaf_index, active_party_ids=active_party_ids)
+
+        root_signature = self.sign(
+            batch_root,
+            leaf_index=leaf_index,
+            signer_ids=signer_ids,
+        )
+
         batch_paths = [self.get_batch_auth_path(levels, i) for i in range(len(messages))]
         return BatchThresholdSignature(root_signature, messages, batch_paths, batch_root)
-    
+
     def verify_batch(self, batch_signature, public_bundle=None):
         results = []
         public_bundle = self.public_bundle if public_bundle is None else public_bundle
-        root_ok = self.verify(batch_signature.batch_root_signature, message=batch_signature.batch_root, public_bundle=public_bundle)
+
+        root_ok = self.verify(
+            batch_signature.batch_root_signature,
+            message=batch_signature.batch_root,
+            public_bundle=public_bundle,
+        )
+
         for message, path in zip(batch_signature.messages, batch_signature.batch_paths):
             msg_leaf = self.batch_message_leaf(message)
             path_ok = self.verify_merkle_path(msg_leaf, path, batch_signature.batch_root)
             results.append(root_ok and path_ok)
 
         return results
-    
+
     def benchmark_batch(self, rounds, batch_size):
         setup_times = []
         batch_sign_times = []
@@ -1138,10 +1157,10 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
                 messages.append(("batch-message-" + str(i) + "-" + str(j)).encode())
 
             t0 = time.perf_counter()
-            scheme = BatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height,)
+            scheme = BatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height)
             t1 = time.perf_counter()
 
-            sig = scheme.sign_batch(messages=messages, active_party_ids=signer_ids)
+            sig = scheme.sign_batch(messages=messages, signer_ids=signer_ids)
             t2 = time.perf_counter()
 
             verify_results = scheme.verify_batch(sig)
@@ -1149,16 +1168,16 @@ class BatchedThresholdHBSScheme(KOfNThresholdHBSScheme):
 
             if not all(verify_results):
                 raise RuntimeError("batch benchmark produced invalid signature")
-            
+
             setup_times.append(t1 - t0)
             batch_sign_times.append(t2 - t1)
             verify_times.append(t3 - t2)
 
         return {
-            "parties":self.parties, 
-            "threshold_k": self.threshold_k, 
-            "tree_height": self.tree_height, 
-            "rounds":rounds, 
+            "parties": self.parties,
+            "threshold_k": self.threshold_k,
+            "tree_height": self.tree_height,
+            "rounds": rounds,
             "batch_size": batch_size,
             "setup_time": round(statistics.mean(setup_times), 8),
             "batch_sign_time": round(statistics.mean(batch_sign_times), 8),
@@ -1231,8 +1250,8 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
             return False
         return self.verify_merkle_path(self.subtree_roots[auth_path.subtree_index], auth_path.upper_path, expected_root)
     
-    def sign(self, message, leaf_index=None, active_party_ids=None):
-        sig = super().sign(message, leaf_index=leaf_index, active_party_ids=active_party_ids)
+    def sign(self, message, leaf_index=None, signer_ids=None):
+        sig = super().sign(message, leaf_index=leaf_index, signer_ids=signer_ids)
         sig.auth_path = self.get_hierarchical_auth_path(sig.leaf_index)
         return sig
     
@@ -1264,9 +1283,9 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
             public_bundle.merkle_root,
         )
     
-    def sign_batch_in_subtree(self, messages, active_party_ids=None, subtree_index=None):
-        subset = self.normalise_subset(active_party_ids)
-        
+    def sign_batch_in_subtree(self, messages, signer_ids=None, subtree_index=None):
+        subset = self.normalise_subset(signer_ids)
+
         if subtree_index is None:
             for candidate in range(self.num_leaves // self.subtree_size):
                 if self.next_unused_leaf_in_subtree(candidate, subset=subset) is not None:
@@ -1275,12 +1294,16 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
 
         if subtree_index is None:
             raise RuntimeError("no subtree with available leaves")
-        
+
         leaf_index = self.next_unused_leaf_in_subtree(subtree_index, subset=subset)
         if leaf_index is None:
             raise RuntimeError("selected subtree has no compatible unused leaf")
-        
-        batch_sig = self.sign_batch(messages, active_party_ids=list(subset), leaf_index=leaf_index)
+
+        batch_sig = self.sign_batch(
+            messages,
+            signer_ids=list(subset),
+            leaf_index=leaf_index,
+        )
 
         return {
             "subtree_index": subtree_index,
@@ -1304,10 +1327,15 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
                 messages.append(("hierarchical-batch-message-" + str(i) + "-" + str(j)).encode())
 
             t0 = time.perf_counter()
-            scheme = HierarchicalBatchedThresholdHBSScheme(self.parties, self.threshold_k, self.tree_height, self.subtree_height,)
+            scheme = HierarchicalBatchedThresholdHBSScheme(
+                self.parties,
+                self.threshold_k,
+                self.tree_height,
+                self.subtree_height,
+            )
             t1 = time.perf_counter()
 
-            batch_result = scheme.sign_batch_in_subtree(messages, active_party_ids=signer_ids)
+            batch_result = scheme.sign_batch_in_subtree(messages, signer_ids=signer_ids)
             t2 = time.perf_counter()
 
             verify_results = scheme.verify_subtree_batch(batch_result)
@@ -1315,17 +1343,17 @@ class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
 
             if not all(verify_results):
                 raise RuntimeError("hierarchical batch benchmark produced invalid signature")
-            
+
             setup_times.append(t1 - t0)
             batch_sign_times.append(t2 - t1)
             verify_times.append(t3 - t2)
 
         return {
-            "parties":self.parties, 
-            "threshold_k": self.threshold_k, 
-            "tree_height": self.tree_height, 
+            "parties": self.parties,
+            "threshold_k": self.threshold_k,
+            "tree_height": self.tree_height,
             "subtree_height": self.subtree_height,
-            "rounds":rounds, 
+            "rounds": rounds,
             "batch_size": batch_size,
             "setup_time": round(statistics.mean(setup_times), 8),
             "hierarchical_batch_sign_time": round(statistics.mean(batch_sign_times), 8),
