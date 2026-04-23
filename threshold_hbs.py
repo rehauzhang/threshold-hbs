@@ -50,11 +50,14 @@ class Round1Response:
 
 
 class Round2Response:
-    def __init__(self, party_id, leaf_index, sk_shares, path_shares):
+    # Lamport distributed path uses sk_shares
+    # Winternitz distributed path uses z_shares
+    def __init__(self, party_id, leaf_index, sk_shares=None, z_shares=None, path_shares=None):
         self.party_id = party_id
         self.leaf_index = leaf_index
-        self.sk_shares = sk_shares
-        self.path_shares = path_shares
+        self.sk_shares = [] if sk_shares is None else sk_shares
+        self.z_shares = [] if z_shares is None else z_shares
+        self.path_shares = [] if path_shares is None else path_shares
 
 class PublicKeyBundle:
     def __init__(self, merkle_root, max_signatures, hash_name, leaves):
@@ -69,15 +72,6 @@ class CRVEntry:
         self.chk = chk_shares
         self.PATH = path_shares
         self.SK = sk_shares
-
-class BenchmarkResult:
-    def __init__(self, parties, tree_height, rounds, setup_avg, sign_avg, verify_avg):
-        self.parties = parties
-        self.tree_height = tree_height
-        self.rounds = rounds
-        self.setup_avg = setup_avg
-        self.sign_avg = sign_avg
-        self.verify_avg = verify_avg
 
     def to_dict(self):
         return {
@@ -119,14 +113,10 @@ class ThresholdHBSScheme:
             raise ValueError("approval_policies must have one entry for each party")
         
         self.approval_policies = approval_policies
-
+        
         self.leaf_secret_keys = []
         self.leaf_public_keys = []
-
         self.party_shares = {}
-        for pid in range(self.parties):
-            self.party_shares[pid] = {}
-
         self.merkle_levels = []
         self.used_leaves = set()
 
@@ -430,12 +420,19 @@ class ThresholdHBSScheme:
 
             if not ok:
                 raise RuntimeError("benchmark produced invalid signature")
-            
+
             setup_times.append(t1 - t0)
             sign_times.append(t2 - t1)
             verify_times.append(t3 - t2)
 
-        return BenchmarkResult(parties=self.parties, tree_height=self.tree_height, rounds=rounds, setup_avg=statistics.mean(setup_times), sign_avg=statistics.mean(sign_times), verify_avg=statistics.mean(verify_times),)
+        return {
+            "parties": self.parties,
+            "tree_height": self.tree_height,
+            "rounds": rounds,
+            "setup_time": round(statistics.mean(setup_times), 8),
+            "sign_time": round(statistics.mean(sign_times), 8),
+            "verify_time": round(statistics.mean(verify_times), 8),
+        }
 
 # Extension 1: use k-of-k subtree to realise a k-of-n signing       
 class KOfNThresholdHBSScheme(ThresholdHBSScheme):
@@ -685,7 +682,6 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         self.current_sessions[(party_id, leaf_index)] = {
             "message": message,
             "session_id": session_id,
-            "signer_ids": tuple(signer_ids),
         }
 
         return Round1Response(
@@ -702,11 +698,13 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if len(round1_responses) != len(signer_ids):
             raise ValueError("missing round1 responses")
 
+        response_parties = sorted(resp.party_id for resp in round1_responses)
+        if response_parties != sorted(signer_ids):
+            raise ValueError("round1 signer set mismatch")
+
         for resp in round1_responses:
             if resp.leaf_index != leaf_index:
                 raise ValueError("round1 response leaf index mismatch")
-            if resp.party_id not in signer_ids:
-                raise ValueError("unexpected signer in round1 responses")
 
         crv_entry = self.crv[leaf_index]
 
@@ -776,11 +774,13 @@ class DistributedThresholdHBSScheme(KOfNThresholdHBSScheme):
         if len(round2_responses) != len(signer_ids):
             raise ValueError("missing round2 responses")
 
+        response_parties = sorted(resp.party_id for resp in round2_responses)
+        if response_parties != sorted(signer_ids):
+            raise ValueError("round2 signer set mismatch")
+
         for resp in round2_responses:
             if resp.leaf_index != leaf_index:
                 raise ValueError("round2 response leaf index mismatch")
-            if resp.party_id not in signer_ids:
-                raise ValueError("unexpected signer in round2 responses")
 
         crv_entry = self.crv[leaf_index]
 
@@ -1186,7 +1186,8 @@ class BatchedThresholdHBSScheme(DistributedThresholdHBSScheme):
         }
     
 # Extension 4: 
-# use Merkle trees within higher layers while leaving leaves as Lamport nodes
+# use hierarchical Merkle trees on top of the distributed batched threshold scheme
+# leaf signing still uses the underlying Lamport/distributed signing flow
 class HierarchicalBatchedThresholdHBSScheme(BatchedThresholdHBSScheme):
     def __init__(self, parties, threshold_k, tree_height, subtree_height=2, approval_policies=None):
         if subtree_height < 1:
@@ -1578,8 +1579,20 @@ class WinternitzThresholdHBSScheme(DistributedThresholdHBSScheme):
             sk_shares = {}
             for chain_index in range(self.num_chains):
                 secret_value = winternitz_sk[chain_index]
-                parts = [self.winternitz_prf_share(pid, leaf_index, chain_index) for pid in subset]
-                sk_shares[chain_index] = self.xor_bytes([secret_value] + parts)
+                base_party_shares = [
+                    self.winternitz_prf_share(pid, leaf_index, chain_index)
+                    for pid in subset
+                ]
+
+                sk_shares[chain_index] = {}
+
+                for digit in range(self.w):
+                    z_secret = self.hash_iter(secret_value, digit)
+                    z_party_parts = [self.hash_iter(share, digit) for share in base_party_shares]
+
+                    sk_shares[chain_index][digit] = self.xor_bytes(
+                        [z_secret] + z_party_parts
+                    )
 
             self.crv[leaf_index] = CRVEntry(
                 r_share=crv_r,
@@ -1607,9 +1620,12 @@ class WinternitzThresholdHBSScheme(DistributedThresholdHBSScheme):
         if expected_auth != chk_value:
             raise PermissionError("randomizer authentication failed")
 
-        sk_shares = []
+        digits = self.randomized_message_digits_with_checksum(leaf_index, randomizer, message)
+
+        z_shares = []
         for chain_index in range(self.num_chains):
-            sk_shares.append(self.winternitz_prf_share(party_id, leaf_index, chain_index))
+            share = self.winternitz_prf_share(party_id, leaf_index, chain_index)
+            z_shares.append(self.hash_iter(share, digits[chain_index]))
 
         path_proto = self.get_auth_path(leaf_index)
         path_shares = []
@@ -1621,7 +1637,7 @@ class WinternitzThresholdHBSScheme(DistributedThresholdHBSScheme):
         return Round2Response(
             party_id=party_id,
             leaf_index=leaf_index,
-            sk_shares=sk_shares,
+            z_shares=z_shares,
             path_shares=path_shares,
         )
 
@@ -1646,16 +1662,20 @@ class WinternitzThresholdHBSScheme(DistributedThresholdHBSScheme):
 
         revealed = []
         for chain_index in range(self.num_chains):
-            parts = [crv_entry.SK[chain_index]]
+            digit = digits[chain_index]
+
+            # paper-style correction at the signature-share level
+            z_crv = crv_entry.SK[chain_index][digit]
+
+            z_parts = [z_crv]
             for resp in round2_responses:
                 if resp.leaf_index != leaf_index:
                     raise ValueError("round2 response leaf index mismatch")
-                if len(resp.sk_shares) != self.num_chains:
+                if len(resp.z_shares) != self.num_chains:
                     raise ValueError("invalid round2 share count")
-                parts.append(resp.sk_shares[chain_index])
+                z_parts.append(resp.z_shares[chain_index])
 
-            secret_element = self.xor_bytes(parts)
-            revealed.append(self.hash_iter(secret_element, digits[chain_index]))
+            revealed.append(self.xor_bytes(z_parts))
 
         path_proto = self.get_auth_path(leaf_index)
         reconstructed_siblings = []
